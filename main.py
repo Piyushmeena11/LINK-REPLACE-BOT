@@ -37,7 +37,7 @@ COLLECTING_FILES, EDITING = range(2)
 # Session timeout (10 minutes)
 SESSION_TIMEOUT = timedelta(minutes=10)
 
-# Health check server
+# ======================== HEALTH CHECK SERVER ========================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -46,17 +46,16 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b'Bot is running!')
     
     def log_message(self, format, *args):
-        pass  # Suppress logs
+        pass
 
 def run_health_server():
     port = int(os.getenv('PORT', 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"🌐 Health check server running on port {port}")
+    logger.info(f"Health check server running on port {port}")
     server.serve_forever()
 
 # ======================== SECURITY ========================
 def owner_only(func):
-    """Decorator to restrict access to owner only"""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id != OWNER_ID:
@@ -70,12 +69,10 @@ def owner_only(func):
 
 # ======================== UTILITIES ========================
 def extract_telegram_links(html_content: str) -> List[Tuple[str, str]]:
-    """Extract Telegram links from HTML with button text"""
     soup = BeautifulSoup(html_content, 'html.parser')
     links = []
     seen = set()
     
-    # Pattern for Telegram links
     telegram_pattern = re.compile(r'(https?://)?(t\.me|telegram\.me)/\S+', re.IGNORECASE)
     
     for tag in soup.find_all(['a', 'button']):
@@ -83,19 +80,15 @@ def extract_telegram_links(html_content: str) -> List[Tuple[str, str]]:
         text = tag.get_text(strip=True) or 'Unnamed Button'
         
         if telegram_pattern.search(href):
-            # Normalize link
             link = href if href.startswith('http') else f'https://{href}'
-            
-            # Deduplicate
             key = (text, link)
             if key not in seen:
                 seen.add(key)
                 links.append(key)
     
-    return links[:5]  # Max 5 buttons
+    return links[:5]
 
 def validate_telegram_link(link: str) -> bool:
-    """Validate if link is a proper Telegram link"""
     try:
         parsed = urlparse(link)
         if parsed.netloc not in ['t.me', 'telegram.me', 'www.t.me', 'www.telegram.me']:
@@ -105,7 +98,6 @@ def validate_telegram_link(link: str) -> bool:
         return False
 
 def replace_links_in_html(html_content: str, old_link: str, new_text: str, new_link: str) -> str:
-    """Replace button text and link in HTML"""
     soup = BeautifulSoup(html_content, 'html.parser')
     
     for tag in soup.find_all(['a', 'button']):
@@ -117,7 +109,6 @@ def replace_links_in_html(html_content: str, old_link: str, new_text: str, new_l
     return str(soup)
 
 def check_session_timeout(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if session has timed out"""
     if 'last_activity' not in context.user_data:
         return True
     
@@ -131,7 +122,6 @@ def check_session_timeout(context: ContextTypes.DEFAULT_TYPE) -> bool:
 # ======================== BOT COMMANDS ========================
 @owner_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
     context.user_data.clear()
     context.user_data['files'] = []
     context.user_data['last_activity'] = datetime.now()
@@ -147,7 +137,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help command handler"""
     help_text = """
 📘 **Bot Usage Guide**
 
@@ -171,7 +160,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel command handler"""
     context.user_data.clear()
     await update.message.reply_text("❌ Session cancelled. Type /start to begin again.")
     return ConversationHandler.END
@@ -179,23 +167,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================== FILE HANDLING ========================
 @owner_only
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive HTML files from user"""
     if check_session_timeout(context):
         await update.message.reply_text("⏱ Session expired. Please /start again.")
         return ConversationHandler.END
     
     file = await update.message.document.get_file()
     
-    # Validate file type
     if not update.message.document.file_name.endswith('.html'):
         await update.message.reply_text("⚠️ Please send only HTML files.")
         return COLLECTING_FILES
     
-    # Download file
     file_content = await file.download_as_bytearray()
     html_content = file_content.decode('utf-8')
     
-    # Extract links
     links = extract_telegram_links(html_content)
     
     if not links:
@@ -204,7 +188,6 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return COLLECTING_FILES
     
-    # Store file data
     context.user_data['files'].append({
         'name': update.message.document.file_name,
         'content': html_content,
@@ -222,7 +205,6 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def done_collecting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User finished uploading files"""
     if check_session_timeout(context):
         await update.message.reply_text("⏱ Session expired. Please /start again.")
         return ConversationHandler.END
@@ -238,7 +220,6 @@ async def done_collecting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDITING
 
 async def show_file_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show buttons for current file"""
     file_idx = context.user_data['current_file']
     files = context.user_data['files']
     
@@ -284,7 +265,6 @@ async def show_file_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ======================== BUTTON EDITING ========================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks"""
     query = update.callback_query
     await query.answer()
     
@@ -326,7 +306,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDITING
 
 async def show_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE, button_idx: int):
-    """Show edit options for selected button"""
     file_idx = context.user_data['current_file']
     current_file = context.user_data['files'][file_idx]
     edited = current_file['edited_links'][button_idx]
@@ -347,7 +326,6 @@ async def show_edit_options(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
 
 async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receive edited text from user"""
     if check_session_timeout(context):
         await update.message.reply_text("⏱ Session expired. Please /start again.")
         return ConversationHandler.END
@@ -385,7 +363,6 @@ async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDITING
 
 async def confirm_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show confirmation before finalizing"""
     edit_count = context.user_data.get('edit_count', 0)
     
     keyboard = [
@@ -404,7 +381,6 @@ async def confirm_finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def finalize_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate and send edited HTML files"""
     files = context.user_data['files']
     
     if update.callback_query:
@@ -413,7 +389,6 @@ async def finalize_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for file_data in files:
         html_content = file_data['content']
         
-        # Apply all edits
         for i, (orig_text, orig_link) in enumerate(file_data['links']):
             edited = file_data['edited_links'][i]
             html_content = replace_links_in_html(
@@ -423,11 +398,9 @@ async def finalize_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 edited['link']
             )
         
-        # Generate new filename
         base_name = os.path.splitext(file_data['name'])[0]
         new_filename = f"{base_name}{RENAME_TAG}.html"
         
-        # Send file
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=html_content.encode('utf-8'),
@@ -444,19 +417,36 @@ async def finalize_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ======================== MAIN ========================
 def main():
-    """Start the bot"""
     if not BOT_TOKEN or not OWNER_ID:
-        logger.error("❌ BOT_TOKEN and OWNER_ID must be set in environment variables!")
+        logger.error("BOT_TOKEN and OWNER_ID must be set!")
         return
     
-    # Start health check server in background
     health_thread = Thread(target=run_health_server, daemon=True)
     health_thread.start()
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            COLLECTING_FILES: 
+            COLLECTING_FILES: [
+                MessageHandler(filters.Document.ALL, receive_file),
+                CommandHandler('done', done_collecting),
+            ],
+            EDITING: [
+                CallbackQueryHandler(button_callback),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edit),
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        conversation_timeout=600
+    )
+    
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler('help', help_command))
+    
+    logger.info("Bot started polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
