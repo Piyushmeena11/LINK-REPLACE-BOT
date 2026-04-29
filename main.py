@@ -6,6 +6,8 @@ from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,6 +36,23 @@ COLLECTING_FILES, EDITING = range(2)
 
 # Session timeout (10 minutes)
 SESSION_TIMEOUT = timedelta(minutes=10)
+
+# Health check server
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running!')
+    
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+def run_health_server():
+    port = int(os.getenv('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"🌐 Health check server running on port {port}")
+    server.serve_forever()
 
 # ======================== SECURITY ========================
 def owner_only(func):
@@ -81,10 +100,6 @@ def validate_telegram_link(link: str) -> bool:
         parsed = urlparse(link)
         if parsed.netloc not in ['t.me', 'telegram.me', 'www.t.me', 'www.telegram.me']:
             return False
-        
-        # Check if reachable (optional, can be slow)
-        # response = requests.head(link, timeout=3, allow_redirects=True)
-        # return response.status_code < 400
         return True
     except:
         return False
@@ -434,30 +449,14 @@ def main():
         logger.error("❌ BOT_TOKEN and OWNER_ID must be set in environment variables!")
         return
     
+    # Start health check server in background
+    health_thread = Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            COLLECTING_FILES: [
-                MessageHandler(filters.Document.ALL, receive_file),
-                CommandHandler('done', done_collecting),
-            ],
-            EDITING: [
-                CallbackQueryHandler(button_callback),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edit),
-            ],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        conversation_timeout=600  # 10 minutes
-    )
-    
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler('help', help_command))
-    
-    logger.info("🤖 Bot started polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+            COLLECTING_FILES: 
