@@ -1,4 +1,1 @@
-python-telegram-bot==20.7
-beautifulsoup4==4.12.2
-requests==2.31.0
-lxml==5.1.0
+# No external dependencies - using built-in libraries only
