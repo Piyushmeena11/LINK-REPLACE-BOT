@@ -1,7 +1,6 @@
 import os
 import io
 import re
-import requests
 import asyncio
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,11 +10,11 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# For Render deployment (no nest_asyncio needed)
+# For Render deployment
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ======================== HEALTH CHECK (For Render) ========================
+# ======================== HEALTH CHECK ========================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -208,7 +207,6 @@ async def menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     init_user_data(ctx)
     
     if query.data == "final":
-        # Calculate Summary
         btns = ctx.user_data["btns"]
         edited_b = len([b for b in btns if (b["new_txt"] != b["orig_txt"] or b["new_hr"] != b["orig_hr"]) and not b["delete"]])
         deleted_b = len([b for b in btns if b["delete"]])
@@ -378,10 +376,13 @@ async def final_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --- Application ---
 def main():
     # Start health server for Render
+    print("Starting health server...")
     Thread(target=health_server, daemon=True).start()
     
+    print("Building application...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
+    print("Adding handlers...")
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.Document.ALL, receive_file)],
         states={
