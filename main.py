@@ -115,45 +115,38 @@ def update_activity(ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['last_activity'] = datetime.now()
 
 def extract_buttons(html_content: str) -> List[Dict]:
-    """Extract Telegram buttons from HTML with enhanced detection"""
-    soup = BeautifulSoup(html_content, "html.parser")
-    seen, buttons = set(), []
-    
-    # Enhanced patterns for better detection
-    for element in soup.find_all(["a", "button"]):
-        href = element.get("href", "")
-        onclick = element.get("onclick", "")
-        data_url = element.get("data-url", "")
+    """Extract Telegram buttons with timeout protection"""
+    try:
+        # Simple and fast BeautifulSoup parsing
+        soup = BeautifulSoup(html_content, "html.parser")
+        seen, buttons = set(), []
         
-        # Check various link sources
-        link = href or data_url
-        if onclick and "window.open" in onclick:
-            # Extract link from onclick
-            onclick_match = re.search(r'["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\']', onclick)
-            if onclick_match:
-                link = onclick_match.group(1)
+        # Only search for basic <a> tags (original working logic)
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "")
+            
+            # Quick Telegram link check
+            if TG_PATTERN.match(href):
+                text = a_tag.get_text(strip=True) or "Button"
+                text = re.sub(r'\s+', ' ', text)  # Normalize spaces
+                
+                # Simple deduplication
+                signature = (text.lower(), href.lower())
+                if signature not in seen and len(text) > 1:
+                    seen.add(signature)
+                    buttons.append({
+                        "orig_txt": text,
+                        "orig_hr": href,
+                        "new_txt": text,
+                        "new_hr": href,
+                        "delete": False
+                    })
         
-        if TG_PATTERN.match(link):
-            text = element.get_text(strip=True) or "Button"
-            text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
-            
-            # Normalize link
-            if not link.startswith(('http', 'tg://')):
-                link = 'https://' + link.lstrip('/')
-            
-            signature = (text.lower(), link.lower())
-            if signature not in seen:
-                seen.add(signature)
-                buttons.append({
-                    "orig_txt": text,
-                    "orig_hr": link,
-                    "new_txt": text,
-                    "new_hr": link,
-                    "delete": False,
-                    "element_type": element.name
-                })
-    
-    return buttons
+        return buttons
+        
+    except Exception as e:
+        print(f"❌ Button extraction error: {e}")
+        return []
 
 def patch_html(html_content: str, buttons: List[Dict], text_map: Dict[str, str], new_title: Optional[str]) -> str:
     """Apply all modifications to HTML content"""
@@ -180,16 +173,9 @@ def patch_html(html_content: str, buttons: List[Dict], text_map: Dict[str, str],
     # 2. Update/Delete Buttons
     for button in buttons:
         # Find matching elements
-        for element in soup.find_all(["a", "button"]):
-            element_link = element.get("href", "") or element.get("data-url", "")
+        for element in soup.find_all("a", href=True):
+            element_link = element.get("href", "")
             element_text = element.get_text(strip=True)
-            
-            # Check onclick for buttons
-            onclick = element.get("onclick", "")
-            if onclick and "window.open" in onclick:
-                onclick_match = re.search(r'["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\']', onclick)
-                if onclick_match:
-                    element_link = onclick_match.group(1)
             
             # Match by original content
             if (element_link.lower() == button["orig_hr"].lower() and 
@@ -200,12 +186,7 @@ def patch_html(html_content: str, buttons: List[Dict], text_map: Dict[str, str],
                     element.decompose()
                 else:
                     # Update element
-                    if element.name == "a":
-                        element["href"] = button["new_hr"]
-                    elif element.name == "button" and onclick:
-                        element["onclick"] = f"window.open('{button['new_hr']}')"
-                    elif element.get("data-url"):
-                        element["data-url"] = button["new_hr"]
+                    element["href"] = button["new_hr"]
                     
                     # Update text content
                     element.clear()
@@ -216,9 +197,9 @@ def patch_html(html_content: str, buttons: List[Dict], text_map: Dict[str, str],
         # Find all text nodes
         for element in soup.find_all(string=re.compile(re.escape(old_text), re.IGNORECASE)):
             # Skip if inside a Telegram button
-            parent_button = element.find_parent(["a", "button"])
+            parent_button = element.find_parent("a")
             if parent_button:
-                parent_link = parent_button.get("href", "") or parent_button.get("data-url", "")
+                parent_link = parent_button.get("href", "")
                 if TG_PATTERN.match(parent_link):
                     continue  # Skip modification inside Telegram buttons
             
@@ -340,7 +321,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return UPLOADING
 
 async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle file uploads with enhanced validation"""
+    """Handle file uploads with timeout protection"""
     if not await owner_only(update):
         return ConversationHandler.END
     
@@ -357,59 +338,58 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("❌ Please send a document file.")
         return UPLOADING
     
+    # Simple filename check (original working logic)
     if not doc.file_name.lower().endswith(('.html', '.htm')):
-        await update.message.reply_text(
-            "⚠️ **Invalid file type**\n\n"
-            "Please send only HTML files:\n"
-            "• .html files\n"
-            "• .htm files"
-        )
+        await update.message.reply_text("❌ Send only .html files.")
         return UPLOADING
     
-    # Check file size (max 20MB)
-    if doc.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text("❌ File too large. Maximum size: 20MB")
+    # File size check (20MB limit)
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("❌ File too large. Max: 20MB")
         return UPLOADING
     
     try:
-        # Download and process file
-        await update.message.reply_text(f"⏳ Processing `{doc.file_name}`...")
+        # Simple processing message
+        processing_msg = await update.message.reply_text(f"⏳ Processing `{doc.file_name}`...")
         
-        file_obj = await doc.get_file()
-        file_bytes = await file_obj.download_as_bytearray()
+        # Download with timeout (original simple logic)
+        file_obj = await asyncio.wait_for(doc.get_file(), timeout=30.0)
+        file_bytes = await asyncio.wait_for(file_obj.download_as_bytearray(), timeout=60.0)
         
-        # Try different encodings
-        html_content = None
-        for encoding in ['utf-8', 'utf-8-sig', 'latin1', 'cp1252']:
-            try:
-                html_content = file_bytes.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
+        # Simple decode (original logic)
+        html_content = file_bytes.decode("utf-8", errors="ignore")
         
-        if html_content is None:
-            html_content = file_bytes.decode('utf-8', errors='ignore')
+        # Quick validation
+        if len(html_content.strip()) < 10:
+            await processing_msg.edit_text("❌ File appears to be empty or corrupted.")
+            return UPLOADING
         
-        # Extract buttons
-        buttons = extract_buttons(html_content)
-        button_count = len(buttons)
-        
-        # Store file
+        # Store file (original logic)
         ctx.user_data["files"][doc.file_name] = html_content
         
-        # Success message
-        msg = f"✅ **{doc.file_name}**\n📊 Found: {button_count} Telegram buttons"
+        # Quick success message
+        file_count = len(ctx.user_data["files"])
+        await processing_msg.edit_text(
+            f"✅ **{doc.file_name}**\n"
+            f"📁 Total files: {file_count}\n"
+            f"📤 Send more or /done to continue"
+        )
         
-        if button_count == 0:
-            msg += "\n⚠️ No Telegram links detected"
-        
-        msg += f"\n\n📁 Total files: {len(ctx.user_data['files'])}"
-        msg += "\n📤 Send more files or /done to continue"
-        
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ **Download timeout.** File too large or slow connection.")
+        return UPLOADING
+    
+    except UnicodeDecodeError:
+        await update.message.reply_text("❌ **Encoding error.** Please ensure file is properly encoded.")
+        return UPLOADING
+    
     except Exception as e:
-        await update.message.reply_text(f"❌ Error processing file: {str(e)}")
+        error_msg = str(e)
+        if len(error_msg) > 100:
+            error_msg = error_msg[:100] + "..."
+        
+        await update.message.reply_text(f"❌ **Processing failed:** {error_msg}")
+        return UPLOADING
     
     return UPLOADING
 
@@ -431,36 +411,52 @@ async def done_uploading(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("⚠️ No files uploaded. Please send HTML files first.")
         return UPLOADING
     
-    await update.message.reply_text("🔄 **Processing files...**\n⚡ Extracting and deduplicating buttons...")
+    # Simple processing message
+    process_msg = await update.message.reply_text("🔄 **Processing files...**")
     
-    # Extract and deduplicate buttons from all files
-    all_buttons = []
-    seen_signatures = set()
-    
-    for filename, content in files.items():
-        file_buttons = extract_buttons(content)
+    try:
+        # Extract buttons from all files (with timeout protection)
+        all_buttons = []
+        seen_signatures = set()
         
-        for button in file_buttons:
-            signature = (button["orig_txt"].lower(), button["orig_hr"].lower())
-            
-            if signature not in seen_signatures:
-                seen_signatures.add(signature)
-                all_buttons.append(button)
-    
-    ctx.user_data["btns"] = all_buttons
-    
-    # Show summary and main menu
-    summary = (
-        f"📊 **Processing Complete!**\n\n"
-        f"• 📁 Files: {len(files)}\n"
-        f"• 🔗 Unique buttons: {len(all_buttons)}\n"
-        f"• 🧠 Smart deduplication: Active\n\n"
-        f"🎛️ **Control Panel Ready:**"
-    )
-    
-    await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
-    await show_main_menu(update, ctx)
-    return SHOWING_MENU
+        for filename, content in files.items():
+            # Quick timeout protection for button extraction
+            try:
+                file_buttons = await asyncio.wait_for(
+                    asyncio.create_task(asyncio.to_thread(extract_buttons, content)), 
+                    timeout=30.0
+                )
+                
+                # Simple deduplication
+                for button in file_buttons:
+                    signature = (button["orig_txt"].lower(), button["orig_hr"].lower())
+                    
+                    if signature not in seen_signatures:
+                        seen_signatures.add(signature)
+                        all_buttons.append(button)
+                        
+            except asyncio.TimeoutError:
+                await process_msg.edit_text(f"⚠️ **Timeout processing:** {filename}")
+                continue
+            except Exception:
+                continue  # Skip problematic files
+        
+        ctx.user_data["btns"] = all_buttons
+        
+        # Success message
+        await process_msg.edit_text(
+            f"✅ **Processing complete!**\n"
+            f"📁 Files: {len(files)}\n"
+            f"🔗 Buttons: {len(all_buttons)}"
+        )
+        
+        # Show main menu
+        await show_main_menu(update, ctx)
+        return SHOWING_MENU
+        
+    except Exception as e:
+        await process_msg.edit_text(f"❌ **Processing failed:** {str(e)[:100]}")
+        return UPLOADING
 
 async def show_main_menu(update_target, ctx: ContextTypes.DEFAULT_TYPE):
     """Display the main menu interface"""
@@ -646,7 +642,8 @@ async def show_session_summary(query, ctx: ContextTypes.DEFAULT_TYPE):
     )
     
     for i, filename in enumerate(files.keys(), 1):
-        summary += f"• {i}. `{filename}`\n"
+        filename_short = filename[:30] + "..." if len(filename) > 30 else filename
+        summary += f"• {i}. `{filename_short}`\n"
     
     if text_map:
         summary += f"\n**Text Replacements:**\n"
@@ -908,7 +905,7 @@ async def generate_final_files(query, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await query.message.reply_document(
                 document=file_obj,
                 filename=new_filename,
-                caption=f"✅ **Generated:** `{new_filename}`\n📄 **Original:** `{original_name}`"
+                caption=f"✅ **Generated:** `{new_filename}`\n📄 **Original:** `{original_name[:30]}{'...' if len(original_name) > 30 else ''}`"
             )
             
             generated_files.append(new_filename)
@@ -936,7 +933,7 @@ async def generate_final_files(query, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ======================== APPLICATION SETUP ========================
 def main():
-    """Main application function"""
+    """Main application function with timeout handling"""
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ Please set BOT_TOKEN in environment variables!")
         return
@@ -950,7 +947,12 @@ def main():
     health_thread.start()
     
     print("🤖 Building Telegram application...")
+    
+    # Add request timeout settings
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Set timeouts for HTTP requests
+    app.bot._request.timeout = 60  # 60 seconds timeout
     
     # Create conversation handler
     conversation_handler = ConversationHandler(
@@ -992,21 +994,30 @@ def main():
                 CallbackQueryHandler(final_confirmation)
             ]
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("start", start)],
+        conversation_timeout=600  # 10 minute conversation timeout
     )
     
     app.add_handler(conversation_handler)
     
-    print(f"✅ Bot ready!")
+    print(f"✅ Bot ready with timeout protection!")
     print(f"🔒 Owner: {OWNER_ID}")
     print(f"🏷️ Rename tag: {RENAME_TAG}")
     print("📱 Starting polling...")
     
-    # Run the bot
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    # Run with error handling
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            timeout=30  # Polling timeout
+        )
+    except Exception as e:
+        print(f"❌ Bot crashed: {e}")
+        print("🔄 Restarting in 5 seconds...")
+        import time
+        time.sleep(5)
+        main()  # Restart on crash
 
 if __name__ == '__main__':
     main()
