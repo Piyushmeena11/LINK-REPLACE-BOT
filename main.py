@@ -1,22 +1,19 @@
 import os
-import logging
+import asyncio
+import json
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update
-from telegram.ext import Application, CommandHandler
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode
 
 # Config
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-logger.info(f"Token: {'OK' if BOT_TOKEN else 'MISSING'}")
-logger.info(f"Owner: {OWNER_ID}")
+print(f"✅ Token: {'SET' if BOT_TOKEN else 'MISSING'}")
+print(f"✅ Owner: {OWNER_ID}")
 
-# Health Check
+# Health Check Server
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -24,68 +21,108 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'Bot is running!')
     
-    def log_message(self, *args): 
+    def log_message(self, *args):
         pass
 
-def health_server():
+def run_health():
+    port = int(os.getenv('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    print(f"🌐 Health server on port {port}")
+    server.serve_forever()
+
+# Telegram Bot Functions
+def send_message(chat_id, text):
     try:
-        port = int(os.getenv('PORT', 10000))
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
-        logger.info(f"Health server on port {port}")
-        server.serve_forever()
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        data = urlencode({
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'Markdown'
+        }).encode()
+        
+        req = Request(url, data=data)
+        with urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
     except Exception as e:
-        logger.error(f"Health server error: {e}")
+        print(f"❌ Send message error: {e}")
+        return None
 
-# Bot Commands
-async def start_command(update: Update, context):
-    user_id = update.effective_user.id
-    if user_id != OWNER_ID:
-        await update.message.reply_text("🚫 Not authorized")
+def get_updates(offset=0):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        if offset:
+            url += f"?offset={offset}"
+        
+        with urlopen(url, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        print(f"❌ Get updates error: {e}")
+        return None
+
+def handle_message(message):
+    if not message.get('text'):
         return
     
-    await update.message.reply_text(
-        "🚀 **Bot is working!**\n\n"
-        "This is a test version.\n"
-        "Send /test to verify functionality.",
-        parse_mode='Markdown'
-    )
-
-async def test_command(update: Update, context):
-    user_id = update.effective_user.id
+    chat_id = message['chat']['id']
+    user_id = message['from']['id']
+    text = message['text']
+    
+    # Owner check
     if user_id != OWNER_ID:
-        await update.message.reply_text("🚫 Not authorized")
+        send_message(chat_id, "🚫 Not authorized")
         return
     
-    await update.message.reply_text("✅ Test successful! Bot is working perfectly.")
+    if text == '/start':
+        send_message(chat_id, 
+            "🚀 **Bot is working!**\n\n"
+            "✅ Authentication: OK\n"
+            "✅ Health check: Running\n"
+            "✅ Deployment: Successful\n\n"
+            "Send /test to verify bot functionality."
+        )
+    elif text == '/test':
+        send_message(chat_id, "✅ Test successful! Bot is fully operational.")
+    elif text == '/status':
+        send_message(chat_id, f"📊 **Status**\nBot Token: Active\nOwner ID: {OWNER_ID}\nHealth: OK")
 
 def main():
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN missing!")
+        print("❌ BOT_TOKEN missing!")
         return
     
     if OWNER_ID == 0:
-        logger.error("❌ OWNER_ID missing!")
+        print("❌ OWNER_ID missing!")
         return
     
-    logger.info("🚀 Starting bot...")
+    print("🚀 Starting bot...")
     
     # Start health server
-    health_thread = Thread(target=health_server, daemon=True)
+    health_thread = Thread(target=run_health, daemon=True)
     health_thread.start()
     
-    # Create bot application
-    try:
-        app = Application.builder().token(BOT_TOKEN).build()
+    # Bot polling loop
+    offset = 0
+    print("🤖 Bot polling started!")
+    
+    while True:
+        try:
+            result = get_updates(offset)
+            if not result or not result.get('ok'):
+                continue
+            
+            for update in result.get('result', []):
+                if 'message' in update:
+                    handle_message(update['message'])
+                
+                offset = update['update_id'] + 1
         
-        # Add handlers
-        app.add_handler(CommandHandler('start', start_command))
-        app.add_handler(CommandHandler('test', test_command))
-        
-        logger.info("🤖 Bot polling started!")
-        app.run_polling(allowed_updates=['message'])
-        
-    except Exception as e:
-        logger.error(f"❌ Bot error: {e}")
+        except KeyboardInterrupt:
+            print("🛑 Bot stopped")
+            break
+        except Exception as e:
+            print(f"❌ Bot error: {e}")
+            import time
+            time.sleep(5)
 
 if __name__ == '__main__':
     main()
