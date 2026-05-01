@@ -1,10 +1,10 @@
 import os
 import re
+import json
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
-import json
 
 # Config
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,7 +22,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'HTML Editor Bot Active!')
+        self.wfile.write(b'HTML Editor Bot with Inline Buttons!')
     def log_message(self, *args): pass
 
 def run_health():
@@ -32,85 +32,126 @@ def run_health():
     server.serve_forever()
 
 # Telegram Functions
-def send_message(chat_id, text):
+def send_message(chat_id, text, reply_markup=None):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = urlencode({
+        data = {
             'chat_id': chat_id,
             'text': text,
             'parse_mode': 'Markdown'
-        }).encode()
-        req = Request(url, data=data)
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+        
+        data_encoded = urlencode(data).encode()
+        req = Request(url, data=data_encoded)
         with urlopen(req, timeout=10) as response:
             return json.loads(response.read().decode())
     except Exception as e:
         print(f"❌ Send error: {e}")
         return None
 
-def send_document(chat_id, filename, content):
+def edit_message(chat_id, message_id, text, reply_markup=None):
     try:
-        # Simple file sending via sendMessage with content
-        send_message(chat_id, f"📄 **{filename}**\n\n```html\n{content[:500]}...\n```\n\n✅ File ready for download!")
-        return True
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+        data = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': text,
+            'parse_mode': 'Markdown'
+        }
+        if reply_markup:
+            data['reply_markup'] = json.dumps(reply_markup)
+        
+        data_encoded = urlencode(data).encode()
+        req = Request(url, data=data_encoded)
+        with urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
     except Exception as e:
-        print(f"❌ Document error: {e}")
-        return False
+        print(f"❌ Edit error: {e}")
+        return None
 
-def get_file_content(file_id):
-    """Simulate getting file content - in real implementation, download from Telegram"""
-    # For demo, return sample HTML with Telegram links
-    return """<!DOCTYPE html>
-<html>
-<head><title>Sample Page</title></head>
-<body>
-    <h1>Welcome to Our Channel</h1>
-    <a href="https://t.me/oldchannel">Join Our Channel</a>
-    <p>Follow us for updates</p>
-    <button onclick="window.open('https://t.me/oldgroup')">Join Group</button>
-    <div>
-        <a href="https://t.me/oldsupport">Contact Support</a>
-    </div>
-    <a href="https://telegram.me/oldnews">Get News</a>
-</body>
-</html>"""
+def answer_callback(callback_query_id, text=""):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+        data = urlencode({
+            'callback_query_id': callback_query_id,
+            'text': text
+        }).encode()
+        req = Request(url, data=data)
+        with urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        print(f"❌ Callback error: {e}")
+        return None
+
+def get_file_info(file_id):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+        with urlopen(url, timeout=10) as response:
+            result = json.loads(response.read().decode())
+            if result.get('ok'):
+                return result['result']
+            return None
+    except Exception as e:
+        print(f"❌ File info error: {e}")
+        return None
+
+def download_file_content(file_path):
+    try:
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        with urlopen(url, timeout=30) as response:
+            content = response.read()
+            try:
+                return content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    return content.decode('latin-1')
+                except UnicodeDecodeError:
+                    return content.decode('utf-8', errors='ignore')
+    except Exception as e:
+        print(f"❌ Download error: {e}")
+        return None
 
 def extract_telegram_buttons(html_content):
     """Extract all Telegram buttons from HTML"""
     buttons = []
     
-    # Find all <a> tags with Telegram links
+    # Pattern 1: <a href="telegram_link">Button Text</a>
     a_pattern = r'<a[^>]*href=["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\'][^>]*>(.*?)</a>'
     a_matches = re.findall(a_pattern, html_content, re.IGNORECASE | re.DOTALL)
     
     for link, text in a_matches:
         clean_text = re.sub(r'<[^>]+>', '', text).strip()
         if clean_text:
-            buttons.append((clean_text, link))
+            buttons.append((clean_text, link.strip()))
     
-    # Find button tags with onclick Telegram links  
-    button_pattern = r'<button[^>]*onclick=["\'][^"\']*(?:window\.open|location\.href)[^"\']*["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\'][^>]*>(.*?)</button>'
-    button_matches = re.findall(button_pattern, html_content, re.IGNORECASE | re.DOTALL)
+    # Pattern 2: <button onclick="window.open('telegram_link')">Text</button>
+    button_pattern1 = r'<button[^>]*onclick=["\'][^"\']*(?:window\.open|location\.href)[^"\']*["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\'][^>]*>(.*?)</button>'
+    button_matches1 = re.findall(button_pattern1, html_content, re.IGNORECASE | re.DOTALL)
     
-    for link, text in button_matches:
+    for link, text in button_matches1:
         clean_text = re.sub(r'<[^>]+>', '', text).strip()
         if clean_text:
-            buttons.append((clean_text, link))
+            buttons.append((clean_text, link.strip()))
     
-    # Remove duplicates and normalize links
+    # Remove duplicates and normalize
     seen = set()
     unique_buttons = []
     
     for text, link in buttons:
-        # Normalize link
         if link.startswith('//'):
             link = 'https:' + link
         elif not link.startswith('http'):
-            link = 'https://' + link
-            
-        key = (text.lower(), link.lower())
-        if key not in seen:
-            seen.add(key)
-            unique_buttons.append((text, link))
+            link = 'https://' + link.lstrip('/')
+        
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        if len(text) >= 2:
+            key = (text.lower().strip(), link.lower().strip())
+            if key not in seen and text and link:
+                seen.add(key)
+                unique_buttons.append((text, link))
     
     return unique_buttons
 
@@ -118,48 +159,146 @@ def apply_changes(html_content, changes):
     """Apply button changes to HTML content"""
     buttons = extract_telegram_buttons(html_content)
     
-    # Apply each change
-    for button_num, new_name, new_link in changes:
-        if 1 <= button_num <= len(buttons):
-            old_name, old_link = buttons[button_num - 1]
+    for button_idx, new_name, new_link in changes:
+        if 0 <= button_idx < len(buttons):
+            old_name, old_link = buttons[button_idx]
             
-            # Replace in HTML
-            # Replace <a> tags
-            old_a_pattern = f'<a([^>]*href=["\'][^"\']*{re.escape(old_link)}[^"\']*["\'][^>]*)>([^<]*{re.escape(old_name)}[^<]*)</a>'
-            new_a = f'<a\\1>{new_name}</a>'
-            html_content = re.sub(old_a_pattern, new_a, html_content, flags=re.IGNORECASE)
+            # Escape for regex
+            old_name_escaped = re.escape(old_name)
+            old_link_escaped = re.escape(old_link)
             
-            # Update href attribute
+            # Replace link in href attributes
             html_content = re.sub(
-                f'href=["\'][^"\']*{re.escape(old_link)}[^"\']*["\']',
+                f'href=["\'][^"\']*{old_link_escaped}[^"\']*["\']',
                 f'href="{new_link}"',
                 html_content,
                 flags=re.IGNORECASE
             )
             
-            # Replace button onclick
-            button_pattern = f'onclick=["\'][^"\']*{re.escape(old_link)}[^"\']*["\']'
-            new_onclick = f'onclick="window.open(\'{new_link}\')"'
-            html_content = re.sub(button_pattern, new_onclick, html_content, flags=re.IGNORECASE)
+            # Replace in onclick attributes
+            html_content = re.sub(
+                f'onclick=["\'][^"\']*{old_link_escaped}[^"\']*["\']',
+                f'onclick="window.open(\'{new_link}\')"',
+                html_content,
+                flags=re.IGNORECASE
+            )
+            
+            # Replace button text in <a> tags
+            html_content = re.sub(
+                f'(<a[^>]*href=["\'][^"\']*{re.escape(new_link)}[^"\']*["\'][^>]*>)[^<]*{old_name_escaped}[^<]*(</a>)',
+                f'\\1{new_name}\\2',
+                html_content,
+                flags=re.IGNORECASE
+            )
+            
+            # Replace button text in <button> tags
+            html_content = re.sub(
+                f'(<button[^>]*>[^<]*){old_name_escaped}([^<]*</button>)',
+                f'\\1{new_name}\\2',
+                html_content,
+                flags=re.IGNORECASE
+            )
     
     return html_content
 
-def format_buttons_list(buttons):
-    """Format buttons as numbered list"""
+def create_buttons_keyboard(buttons, changes, page=0):
+    """Create inline keyboard with buttons"""
+    keyboard = []
+    
+    # Show 8 buttons per page (2 rows of 4)
+    buttons_per_page = 8
+    start_idx = page * buttons_per_page
+    end_idx = min(start_idx + buttons_per_page, len(buttons))
+    
+    # Create button grid (2 columns)
+    for i in range(start_idx, end_idx, 2):
+        row = []
+        
+        # First button
+        button_text, _ = buttons[i]
+        display_text = button_text[:25] + "..." if len(button_text) > 25 else button_text
+        
+        # Add ✅ if edited
+        if any(change[0] == i for change in changes):
+            display_text = f"✅ {display_text}"
+        else:
+            display_text = f"📝 {display_text}"
+            
+        row.append({
+            "text": display_text,
+            "callback_data": f"edit_{i}"
+        })
+        
+        # Second button (if exists)
+        if i + 1 < end_idx:
+            button_text2, _ = buttons[i + 1]
+            display_text2 = button_text2[:25] + "..." if len(button_text2) > 25 else button_text2
+            
+            if any(change[0] == i + 1 for change in changes):
+                display_text2 = f"✅ {display_text2}"
+            else:
+                display_text2 = f"📝 {display_text2}"
+                
+            row.append({
+                "text": display_text2,
+                "callback_data": f"edit_{i+1}"
+            })
+        
+        keyboard.append(row)
+    
+    # Navigation buttons
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "⬅️ Previous", "callback_data": f"page_{page-1}"})
+    
+    if end_idx < len(buttons):
+        nav_row.append({"text": "Next ➡️", "callback_data": f"page_{page+1}"})
+    
+    if nav_row:
+        keyboard.append(nav_row)
+    
+    # Generate file button
+    changes_count = len(changes)
+    generate_text = f"🎉 Generate File ({changes_count} changes)" if changes_count > 0 else "🎉 Generate File"
+    keyboard.append([{"text": generate_text, "callback_data": "generate"}])
+    
+    return {"inline_keyboard": keyboard}
+
+def show_buttons_interface(chat_id, message_id, filename, buttons, changes, page=0):
+    """Show the main buttons interface"""
     if not buttons:
-        return "❌ No Telegram buttons found in this file."
+        text = f"❌ **No Telegram buttons found** in `{filename}`\n\nMake sure your HTML contains Telegram links!"
+        keyboard = {"inline_keyboard": [[{"text": "🔄 Upload New File", "callback_data": "new_file"}]]}
+        
+        if message_id:
+            edit_message(chat_id, message_id, text, keyboard)
+        else:
+            send_message(chat_id, text, keyboard)
+        return
     
-    text = "🔗 **Telegram Buttons Found:**\n\n"
-    for i, (name, link) in enumerate(buttons, 1):
-        text += f"`{i}.` **{name}**\n   `{link}`\n\n"
+    # Create header text
+    total_pages = (len(buttons) - 1) // 8 + 1
+    changes_count = len(changes)
     
-    text += "📝 **To edit a button, send:**\n"
-    text += "`number | new name | new link`\n\n"
-    text += "**Example:**\n"
-    text += "`1 | Join New Channel | https://t.me/newchannel`\n\n"
-    text += "📤 **When done, send:** `/generate`"
+    text = f"🔗 **Telegram Buttons in `{filename}`**\n\n"
+    text += f"📊 **Found:** {len(buttons)} buttons"
     
-    return text
+    if total_pages > 1:
+        text += f" (Page {page + 1}/{total_pages})"
+    
+    if changes_count > 0:
+        text += f"\n✅ **Changes:** {changes_count}"
+    
+    text += "\n\n📝 **Click any button to edit it:**"
+    
+    # Create keyboard
+    keyboard = create_buttons_keyboard(buttons, changes, page)
+    
+    # Send or edit message
+    if message_id:
+        edit_message(chat_id, message_id, text, keyboard)
+    else:
+        send_message(chat_id, text, keyboard)
 
 def handle_message(message):
     if not message.get('text') and not message.get('document'):
@@ -178,12 +317,12 @@ def handle_message(message):
         text = message['text'].strip()
         
         if text.startswith('/start'):
-            user_sessions[user_id] = {'state': 'waiting_file', 'files': {}}
+            user_sessions[user_id] = {'state': 'waiting_file'}
             send_message(chat_id,
                 "🚀 **HTML Button Editor Bot**\n\n"
-                "📤 **Send me an HTML file** containing Telegram buttons.\n"
-                "🔍 I'll scan and show you all the buttons with numbers.\n"
-                "✏️ You can then edit them with simple commands.\n\n"
+                "📤 **Send me an HTML file** with Telegram buttons.\n"
+                "🔍 I'll show them as **clickable buttons** for easy editing.\n"
+                "✏️ Click → Edit → Generate!\n\n"
                 "📋 **Commands:**\n"
                 "/help - Usage guide\n"
                 "/cancel - Cancel session"
@@ -191,15 +330,14 @@ def handle_message(message):
         
         elif text.startswith('/help'):
             send_message(chat_id,
-                "📘 **How to Use:**\n\n"
-                "1️⃣ Send HTML file\n"
-                "2️⃣ I'll show numbered button list\n"
-                "3️⃣ Send: `number | new name | new link`\n"
-                "4️⃣ Send `/generate` to get updated file\n\n"
-                "**Example:**\n"
-                "`1 | New Channel Name | https://t.me/newchannel`\n"
-                "`2 | Updated Group | https://t.me/newgroup`\n\n"
-                "✅ Simple and fast!"
+                "📘 **Step-by-Step Guide:**\n\n"
+                "1️⃣ **Upload** HTML file with Telegram links\n"
+                "2️⃣ **Click** any button to edit it\n"
+                "3️⃣ **Send** new details as: `Name | Link`\n"
+                "4️⃣ **Generate** updated file when done\n\n"
+                "**Edit Format:**\n"
+                "`Premium Channel | https://t.me/premium`\n\n"
+                "✅ **Visual, fast, and easy!**"
             )
         
         elif text.startswith('/cancel'):
@@ -207,114 +345,220 @@ def handle_message(message):
                 del user_sessions[user_id]
             send_message(chat_id, "❌ Session cancelled. Send /start to begin again.")
         
-        elif text.startswith('/generate'):
-            if user_id not in user_sessions or 'current_file' not in user_sessions[user_id]:
-                send_message(chat_id, "⚠️ No file loaded. Please send an HTML file first.")
+        # Handle edit input
+        elif user_id in user_sessions and user_sessions[user_id].get('state') == 'editing':
+            if '|' not in text:
+                send_message(chat_id,
+                    "❌ **Invalid format!**\n\n"
+                    "✅ **Correct format:**\n"
+                    "`New Name | New Link`\n\n"
+                    "**Example:**\n"
+                    "`Premium Channel | https://t.me/premium`"
+                )
+                return
+            
+            parts = [part.strip() for part in text.split('|', 1)]
+            if len(parts) != 2:
+                send_message(chat_id, "❌ **Please use format:** `Name | Link`")
+                return
+            
+            new_name, new_link = parts
+            
+            if not ('t.me' in new_link.lower() or 'telegram.me' in new_link.lower()):
+                send_message(chat_id, "⚠️ **Invalid link!** Please use Telegram links (t.me or telegram.me)")
                 return
             
             session = user_sessions[user_id]
-            original_html = session['current_file']['content']
-            filename = session['current_file']['name']
-            changes = session.get('changes', [])
+            button_idx = session['editing_button']
             
-            if not changes:
-                send_message(chat_id, "ℹ️ No changes made. Sending original file.")
-                updated_html = original_html
-            else:
-                updated_html = apply_changes(original_html, changes)
-                send_message(chat_id, f"✅ Applied {len(changes)} change(s)")
+            # Update changes
+            if 'changes' not in session:
+                session['changes'] = []
             
-            # Generate new filename
-            base_name = filename.replace('.html', '')
-            new_filename = f"{base_name}{RENAME_TAG}.html"
+            # Remove existing change for this button
+            session['changes'] = [c for c in session['changes'] if c[0] != button_idx]
             
-            # Send updated file content
-            send_message(chat_id, f"📄 **{new_filename}**\n\n```html\n{updated_html}\n```")
-            send_message(chat_id, "🎉 **File generated successfully!**\n\nSend /start for new session.")
+            # Add new change
+            session['changes'].append((button_idx, new_name, new_link))
             
-            # Clean session
-            if user_id in user_sessions:
-                del user_sessions[user_id]
-        
-        # Handle edit commands: "number | new name | new link"
-        elif '|' in text and user_id in user_sessions and 'current_file' in user_sessions[user_id]:
-            try:
-                parts = [part.strip() for part in text.split('|')]
-                if len(parts) != 3:
-                    send_message(chat_id, "❌ **Invalid format!**\n\nUse: `number | new name | new link`")
-                    return
-                
-                button_num = int(parts[0])
-                new_name = parts[1]
-                new_link = parts[2]
-                
-                # Validate link
-                if not ('t.me' in new_link.lower() or 'telegram.me' in new_link.lower()):
-                    send_message(chat_id, "⚠️ Please provide a valid Telegram link (t.me or telegram.me)")
-                    return
-                
-                # Add to changes
-                if 'changes' not in user_sessions[user_id]:
-                    user_sessions[user_id]['changes'] = []
-                
-                # Remove existing change for this button
-                user_sessions[user_id]['changes'] = [
-                    c for c in user_sessions[user_id]['changes'] 
-                    if c[0] != button_num
-                ]
-                
-                # Add new change
-                user_sessions[user_id]['changes'].append((button_num, new_name, new_link))
-                
-                send_message(chat_id, 
-                    f"✅ **Button {button_num} updated:**\n"
-                    f"📝 Name: `{new_name}`\n"
-                    f"🔗 Link: `{new_link}`\n\n"
-                    f"📊 Total changes: {len(user_sessions[user_id]['changes'])}\n\n"
-                    f"Continue editing or send `/generate`"
-                )
-                
-            except ValueError:
-                send_message(chat_id, "❌ **Invalid button number!**\n\nUse: `number | new name | new link`")
-            except Exception as e:
-                send_message(chat_id, f"❌ Error processing command: {str(e)}")
+            # Show updated interface
+            session['state'] = 'viewing'
+            session.pop('editing_button', None)
+            
+            send_message(chat_id,
+                f"✅ **Button updated!**\n\n"
+                f"**New Name:** `{new_name}`\n"
+                f"**New Link:** `{new_link}`\n\n"
+                f"📊 **Total changes:** {len(session['changes'])}"
+            )
+            
+            # Show updated buttons interface
+            show_buttons_interface(
+                chat_id, None,
+                session['filename'],
+                session['buttons'],
+                session['changes'],
+                session.get('page', 0)
+            )
     
     # Handle file uploads
     elif message.get('document'):
         doc = message['document']
         
-        if not doc['file_name'].endswith('.html'):
-            send_message(chat_id, "⚠️ **Please send only HTML files (.html)**")
+        if not (doc['file_name'].endswith('.html') or doc['file_name'].endswith('.htm')):
+            send_message(chat_id, "⚠️ **Please send HTML files only** (.html or .htm)")
             return
         
-        # Get file content (in real bot, you'd download via file_id)
-        html_content = get_file_content(doc['file_id'])
+        send_message(chat_id, f"⏳ **Processing** `{doc['file_name']}`...\n📥 Downloading and scanning...")
+        
+        # Get and download file
+        file_info = get_file_info(doc['file_id'])
+        if not file_info:
+            send_message(chat_id, "❌ **Error getting file info.** Please try again.")
+            return
+        
+        html_content = download_file_content(file_info['file_path'])
+        if not html_content:
+            send_message(chat_id, "❌ **Error downloading file.** Please try again.")
+            return
         
         # Extract buttons
         buttons = extract_telegram_buttons(html_content)
-        
-        if not buttons:
-            send_message(chat_id, "❌ **No Telegram buttons found** in this HTML file.\n\nMake sure your HTML contains links like `https://t.me/channel`")
-            return
         
         # Store in session
         if user_id not in user_sessions:
             user_sessions[user_id] = {}
         
-        user_sessions[user_id]['current_file'] = {
-            'name': doc['file_name'],
-            'content': html_content
-        }
-        user_sessions[user_id]['changes'] = []
+        user_sessions[user_id].update({
+            'state': 'viewing',
+            'filename': doc['file_name'],
+            'html_content': html_content,
+            'buttons': buttons,
+            'changes': [],
+            'page': 0
+        })
         
-        # Send buttons list
-        buttons_text = format_buttons_list(buttons)
-        send_message(chat_id, buttons_text)
+        # Show buttons interface
+        show_buttons_interface(chat_id, None, doc['file_name'], buttons, [], 0)
+
+def handle_callback_query(callback_query):
+    chat_id = callback_query['message']['chat']['id']
+    user_id = callback_query['from']['id']
+    message_id = callback_query['message']['message_id']
+    callback_data = callback_query['data']
+    
+    # Owner check
+    if user_id != OWNER_ID:
+        answer_callback(callback_query['id'], "🚫 Not authorized")
+        return
+    
+    answer_callback(callback_query['id'])
+    
+    if user_id not in user_sessions:
+        send_message(chat_id, "⚠️ Session expired. Send /start to begin again.")
+        return
+    
+    session = user_sessions[user_id]
+    
+    if callback_data.startswith('edit_'):
+        # Edit button
+        button_idx = int(callback_data.split('_')[1])
+        
+        if 0 <= button_idx < len(session['buttons']):
+            button_name, button_link = session['buttons'][button_idx]
+            
+            session['state'] = 'editing'
+            session['editing_button'] = button_idx
+            
+            edit_message(chat_id, message_id,
+                f"✏️ **Editing Button:**\n\n"
+                f"**Current Name:** `{button_name}`\n"
+                f"**Current Link:** `{button_link}`\n\n"
+                f"📝 **Send new details as:**\n"
+                f"`New Name | New Link`\n\n"
+                f"**Example:**\n"
+                f"`Premium Channel | https://t.me/premium`",
+                {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "cancel_edit"}]]}
+            )
+    
+    elif callback_data.startswith('page_'):
+        # Page navigation
+        page = int(callback_data.split('_')[1])
+        session['page'] = page
+        
+        show_buttons_interface(
+            chat_id, message_id,
+            session['filename'],
+            session['buttons'],
+            session['changes'],
+            page
+        )
+    
+    elif callback_data == 'cancel_edit':
+        # Cancel editing
+        session['state'] = 'viewing'
+        session.pop('editing_button', None)
+        
+        show_buttons_interface(
+            chat_id, message_id,
+            session['filename'],
+            session['buttons'],
+            session['changes'],
+            session.get('page', 0)
+        )
+    
+    elif callback_data == 'generate':
+        # Generate updated file
+        if not session.get('changes'):
+            answer_callback(callback_query['id'], "No changes made!")
+            return
+        
+        edit_message(chat_id, message_id,
+            f"⏳ **Generating updated file...**\n\n"
+            f"📊 **Applying {len(session['changes'])} changes**"
+        )
+        
+        # Apply changes
+        updated_html = apply_changes(session['html_content'], session['changes'])
+        
+        # Generate filename
+        base_name = session['filename'].replace('.html', '').replace('.htm', '')
+        new_filename = f"{base_name}{RENAME_TAG}.html"
+        
+        # Send file content
+        if len(updated_html) > 3000:
+            preview = updated_html[:3000] + "\n\n... (file truncated for display)"
+        else:
+            preview = updated_html
+        
+        send_message(chat_id, f"📄 **{new_filename}**\n\n```html\n{preview}\n```")
+        
+        if len(updated_html) > 3000:
+            send_message(chat_id, f"📊 **Full file size:** {len(updated_html)} characters")
+        
+        send_message(chat_id,
+            "🎉 **File generated successfully!**\n\n"
+            "📋 **Summary:**\n"
+            f"✅ Changes applied: {len(session['changes'])}\n"
+            f"📄 File: `{new_filename}`\n\n"
+            "Send /start for new session."
+        )
+        
+        # Clean session
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+    
+    elif callback_data == 'new_file':
+        # Start new file upload
+        user_sessions[user_id] = {'state': 'waiting_file'}
+        edit_message(chat_id, message_id,
+            "📤 **Send me a new HTML file** with Telegram buttons to edit."
+        )
 
 def get_updates(offset=0):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}"
-        with urlopen(url, timeout=10) as response:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
+        with urlopen(url, timeout=35) as response:
             return json.loads(response.read().decode())
     except Exception as e:
         print(f"❌ Updates error: {e}")
@@ -325,14 +569,14 @@ def main():
         print("❌ BOT_TOKEN or OWNER_ID missing!")
         return
     
-    print("🚀 Starting HTML Button Editor Bot...")
+    print("🚀 Starting Inline Buttons HTML Editor Bot...")
     
     # Health server
     Thread(target=run_health, daemon=True).start()
     
     # Bot polling
     offset = 0
-    print("🤖 Bot polling started!")
+    print("🤖 Bot with inline buttons started!")
     
     while True:
         try:
@@ -343,6 +587,9 @@ def main():
             for update in result.get('result', []):
                 if 'message' in update:
                     handle_message(update['message'])
+                elif 'callback_query' in update:
+                    handle_callback_query(update['callback_query'])
+                
                 offset = update['update_id'] + 1
         
         except KeyboardInterrupt:
