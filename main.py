@@ -227,8 +227,13 @@ async def final_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     await application.bot.delete_webhook(drop_pending_updates=True)
 
+# --- Application ---
 def main():
+    # Start health server for Render
+    print("Starting health server...")
     Thread(target=health_server, daemon=True).start()
+    
+    print("Building application with cleanup...")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
     app.add_handler(ConversationHandler(
@@ -244,12 +249,14 @@ def main():
             GLOBAL_LINK_REPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_link)],
             EDITING_FILENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filename)],
             EDITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)],
-            CONFIRMING: [CallbackQueryHandler(final_finish)],
+            CONFIRMING: [CallbackQueryHandler(final_finish, pattern="^(y|n)$")], # FIXED: Added pattern here
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False
     ))
-    app.run_polling(drop_pending_updates=True)
+    
+    print("🤖 Bot Ready! Polling started...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == '__main__':
     main()
