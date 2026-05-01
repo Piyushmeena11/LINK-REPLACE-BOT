@@ -1,235 +1,571 @@
 import os
+import io
 import re
-import json
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
-import base64
+import requests
+import asyncio
+from dotenv import load_dotenv
+from bs4 import BeautifulSoup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode
 
-# Config
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-RENAME_TAG = os.getenv("RENAME_TAG", "_STRANGE")
+# ─────────────────────────────────────────
+# ENV LOAD
+# ─────────────────────────────────────────
+load_dotenv()
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+OWNER_ID   = int(os.getenv("OWNER_ID"))
+RENAME_TAG = os.getenv("RENAME_TAG", "_edited")
 
-print(f"✅ Config loaded - Owner: {OWNER_ID}")
+# ─────────────────────────────────────────
+# STATES
+# ─────────────────────────────────────────
+UPLOADING       = 1
+SHOWING_BUTTONS = 2
+EDITING_NAME    = 3
+EDITING_LINK    = 4
+CONFIRMING      = 5
 
-# Health Check
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'HTML Editor Bot Running!')
-    def log_message(self, *args): pass
+# ─────────────────────────────────────────
+# TELEGRAM LINK PATTERN
+# ─────────────────────────────────────────
+TG_PATTERN = re.compile(
+    r'^(?:https?://)?(?:t\.me|telegram\.(?:me|dog))|^tg://',
+    re.IGNORECASE
+)
 
-def run_health():
-    port = int(os.getenv('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    print(f"🌐 Health server: {port}")
-    server.serve_forever()
+# ─────────────────────────────────────────
+# OWNER CHECK
+# ─────────────────────────────────────────
+async def owner_only(update: Update) -> bool:
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text(
+            "⛔ Sorry, you are not authorized to use this bot."
+        )
+        return False
+    return True
 
-# Bot Session Storage
-user_sessions = {}
+# ─────────────────────────────────────────
+# LINK VALIDATOR
+# ─────────────────────────────────────────
+def validate_telegram_link(link: str) -> tuple[bool, str]:
+    """
+    Returns (is_valid, message)
+    First checks format, then checks if link is reachable.
+    """
+    if not TG_PATTERN.match(link):
+        return False, "❌ Invalid format. Please send a valid Telegram link (e.g. https://t.me/username)"
 
-# Telegram API Functions
-def send_message(chat_id, text, reply_markup=None):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {
-            'chat_id': chat_id,
-            'text': text,
-            'parse_mode': 'Markdown'
-        }
-        if reply_markup:
-            data['reply_markup'] = json.dumps(reply_markup)
-        
-        data_encoded = urlencode(data).encode()
-        req = Request(url, data=data_encoded)
-        with urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode())
-    except Exception as e:
-        print(f"❌ Send error: {e}")
-        return None
+        response = requests.head(link, timeout=5, allow_redirects=True)
+        if response.status_code == 200:
+            return True, "✅ Link is valid and working!"
+        elif response.status_code == 404:
+            return False, "❌ Link not found on Telegram. Please check again."
+        else:
+            return True, "⚠️ Link format is valid but could not fully verify. Proceeding anyway."
+    except requests.exceptions.RequestException:
+        return True, "⚠️ Could not verify link reachability right now. Proceeding anyway."
 
-def send_document(chat_id, filename, content):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        
-        boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
-        body = f'--{boundary}\r\n'
-        body += f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
-        body += f'--{boundary}\r\n'
-        body += f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-        body += f'Content-Type: text/html\r\n\r\n{content}\r\n'
-        body += f'--{boundary}--\r\n'
-        
-        req = Request(url, data=body.encode('utf-8'))
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        
-        with urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode())
-    except Exception as e:
-        print(f"❌ Document send error: {e}")
-        return None
+# ─────────────────────────────────────────
+# HTML PARSER — Extract Telegram Buttons
+# ─────────────────────────────────────────
+def extract_telegram_buttons(html_content: str) -> list[dict]:
+    """
+    Extract all unique Telegram links from HTML file.
+    Returns list of dicts: {text, href}
+    Deduplication by (text + href) pair.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    seen = set()
+    buttons = []
 
-def extract_telegram_links(html_content):
-    """Extract Telegram links from HTML"""
-    links = []
-    # Simple regex to find Telegram links
-    pattern = r'(https?://)?(t\.me|telegram\.me)/\S+'
-    matches = re.findall(pattern, html_content, re.IGNORECASE)
-    
-    for match in matches[:5]:  # Max 5 links
-        full_match = ''.join(match)
-        if not full_match.startswith('http'):
-            full_match = f'https://{full_match}'
-        links.append(('Button', full_match))
-    
-    return links
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if TG_PATTERN.match(href):
+            text = a.get_text(strip=True) or a.get("title", "") or "Unknown Button"
+            key  = (text.lower(), href.lower())
+            if key not in seen:
+                seen.add(key)
+                buttons.append({
+                    "original_text": text,
+                    "original_href": href,
+                    "new_text":      text,
+                    "new_href":      href,
+                })
 
-def handle_message(message):
-    if not message.get('text') and not message.get('document'):
-        return
-    
-    chat_id = message['chat']['id']
-    user_id = message['from']['id']
-    
-    # Owner check
-    if user_id != OWNER_ID:
-        send_message(chat_id, "🚫 Not authorized")
-        return
-    
-    # Text commands
-    if message.get('text'):
-        text = message['text']
-        
-        if text == '/start':
-            user_sessions[user_id] = {'files': [], 'state': 'collecting'}
-            send_message(chat_id, 
-                "🚀 **HTML Button Editor Bot**\n\n"
-                "📤 Send me HTML file(s) containing Telegram links.\n"
-                "✅ When done, type /done to start editing.\n"
-                "❓ Type /help for guide."
+    return buttons
+
+# ─────────────────────────────────────────
+# HTML PATCHER — Apply Edits
+# ─────────────────────────────────────────
+def patch_html(html_content: str, buttons: list[dict]) -> str:
+    """
+    Replace old (text, href) with new (text, href) in HTML.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    for btn in buttons:
+        for a in soup.find_all("a", href=True):
+            if (
+                a["href"].lower()          == btn["original_href"].lower() and
+                a.get_text(strip=True).lower() == btn["original_text"].lower()
+            ):
+                a["href"]  = btn["new_href"]
+                if a.string:
+                    a.string = btn["new_text"]
+
+    return str(soup)
+
+# ─────────────────────────────────────────
+# BUILD MAIN BUTTON LIST KEYBOARD
+# ─────────────────────────────────────────
+def build_button_list_keyboard(buttons: list[dict]) -> InlineKeyboardMarkup:
+    keyboard = []
+    for idx, btn in enumerate(buttons):
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"🔘 {btn['new_text']}",
+                callback_data=f"btn_{idx}"
             )
-        
-        elif text == '/help':
-            send_message(chat_id,
-                "📘 **Usage Guide**\n\n"
-                "1️⃣ Send HTML files\n"
-                "2️⃣ Type /done to edit\n" 
-                "3️⃣ Click buttons to edit\n"
-                "4️⃣ Download edited files\n\n"
-                "**Commands:**\n"
-                "/start - New session\n"
-                "/help - This guide\n"
-                "/cancel - Cancel session"
+        ])
+    keyboard.append([
+        InlineKeyboardButton("✅ Done / Complete", callback_data="done")
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+# ─────────────────────────────────────────
+# BUILD EDIT OPTIONS KEYBOARD
+# ─────────────────────────────────────────
+def build_edit_keyboard(idx: int) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Edit Name", callback_data=f"edit_name_{idx}"),
+            InlineKeyboardButton("🔗 Edit Link", callback_data=f"edit_link_{idx}"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Back",      callback_data="back_to_list"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ─────────────────────────────────────────
+# BUILD CONFIRM KEYBOARD
+# ─────────────────────────────────────────
+def build_confirm_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, Apply",  callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ Cancel",       callback_data="confirm_no"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ─────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    ctx.user_data.clear()
+    ctx.user_data["files"]   = {}   # filename -> html_content
+    ctx.user_data["buttons"] = []   # unified deduplicated button list
+
+    await update.message.reply_text(
+        "👋 *Welcome!*\n\n"
+        "Please send me your HTML file(s) one by one.\n"
+        "When you are done uploading, type /done\n\n"
+        "Type /help anytime for instructions.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return UPLOADING
+
+# ─────────────────────────────────────────
+# /help
+# ─────────────────────────────────────────
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+
+    await update.message.reply_text(
+        "🧾 *BOT GUIDE*\n\n"
+        "1️⃣ Send your HTML files (one by one).\n"
+        "2️⃣ When all files are sent, type /done\n"
+        "3️⃣ Bot will show all Telegram buttons found.\n"
+        "4️⃣ Tap any button to view and edit its name or link.\n"
+        "5️⃣ When editing is complete, tap ✅ Done.\n"
+        "6️⃣ Your updated HTML file(s) will be sent back.\n\n"
+        "⚠️ Session expires after 10 minutes of inactivity.\n"
+        "🔄 Use /start to begin a new session anytime.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ─────────────────────────────────────────
+# FILE RECEIVE HANDLER
+# ─────────────────────────────────────────
+async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    doc = update.message.document
+
+    # Only HTML files allowed
+    if doc.mime_type not in ("text/html", "application/octet-stream") and \
+       not doc.file_name.endswith(".html"):
+        await update.message.reply_text("⚠️ Please send only .html files.")
+        return UPLOADING
+
+    filename = doc.file_name
+
+    # Duplicate file check
+    if filename in ctx.user_data.get("files", {}):
+        await update.message.reply_text(
+            f"⚠️ `{filename}` was already uploaded. Skipping duplicate.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return UPLOADING
+
+    # Download file
+    file_obj  = await doc.get_file()
+    raw_bytes = await file_obj.download_as_bytearray()
+    html_text = raw_bytes.decode("utf-8", errors="ignore")
+
+    ctx.user_data["files"][filename] = html_text
+
+    total = len(ctx.user_data["files"])
+    await update.message.reply_text(
+        f"✅ `{filename}` received! Total files: {total}\n"
+        f"Send more files or type /done when finished.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return UPLOADING
+
+# ─────────────────────────────────────────
+# /done — Process all files
+# ─────────────────────────────────────────
+async def done_uploading(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    files = ctx.user_data.get("files", {})
+    if not files:
+        await update.message.reply_text("⚠️ No files uploaded yet. Please send HTML files first.")
+        return UPLOADING
+
+    # Extract + deduplicate buttons across all files
+    seen    = set()
+    buttons = []
+
+    for filename, html_content in files.items():
+        extracted = extract_telegram_buttons(html_content)
+        for btn in extracted:
+            key = (btn["original_text"].lower(), btn["original_href"].lower())
+            if key not in seen:
+                seen.add(key)
+                buttons.append(btn)
+
+    if not buttons:
+        await update.message.reply_text(
+            "⚠️ No Telegram links found in your HTML files.\n"
+            "Please check your files and try again with /start"
+        )
+        return ConversationHandler.END
+
+    ctx.user_data["buttons"] = buttons
+
+    total_files   = len(files)
+    total_buttons = len(buttons)
+
+    await update.message.reply_text(
+        f"📂 *{total_files} file(s)* processed.\n"
+        f"🔘 *{total_buttons} unique Telegram button(s)* found.\n\n"
+        f"Tap any button below to edit its name or link:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_button_list_keyboard(buttons)
+    )
+    return SHOWING_BUTTONS
+
+# ─────────────────────────────────────────
+# CALLBACK: Button tapped from list
+# ─────────────────────────────────────────
+async def button_tapped(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query   = update.callback_query
+    await query.answer()
+
+    data    = query.data
+    buttons = ctx.user_data.get("buttons", [])
+
+    # ── Back to main list ──
+    if data == "back_to_list":
+        await query.edit_message_text(
+            "🔘 *Button List*\nTap any button to view or edit:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_button_list_keyboard(buttons)
+        )
+        return SHOWING_BUTTONS
+
+    # ── Done tapped ──
+    if data == "done":
+        edited = [b for b in buttons if
+                  b["new_text"] != b["original_text"] or
+                  b["new_href"] != b["original_href"]]
+
+        if not edited:
+            await query.edit_message_text(
+                "⚠️ No changes were made.\n"
+                "Do you still want to generate the file?",
+                reply_markup=build_confirm_keyboard()
             )
-        
-        elif text == '/done':
-            if user_id in user_sessions and user_sessions[user_id]['files']:
-                files = user_sessions[user_id]['files']
-                total_buttons = sum(len(f['links']) for f in files)
-                
-                send_message(chat_id, f"📊 **Summary:**\n{len(files)} files, {total_buttons} buttons found\n\n⏳ Processing...")
-                
-                # Send edited files
-                for file_data in files:
-                    base_name = file_data['name'].replace('.html', '')
-                    new_filename = f"{base_name}{RENAME_TAG}.html"
-                    send_document(chat_id, new_filename, file_data['content'])
-                
-                send_message(chat_id, "🎉 All files processed! Type /start for new session.")
-                if user_id in user_sessions:
-                    del user_sessions[user_id]
-            else:
-                send_message(chat_id, "⚠️ No files uploaded. Send HTML files first.")
-        
-        elif text == '/cancel':
-            if user_id in user_sessions:
-                del user_sessions[user_id]
-            send_message(chat_id, "❌ Session cancelled. Type /start to begin again.")
-    
-    # File handling
-    elif message.get('document'):
-        doc = message['document']
-        if not doc['file_name'].endswith('.html'):
-            send_message(chat_id, "⚠️ Please send only HTML files.")
-            return
-        
-        # Get file content (simplified - in real implementation you'd download the file)
-        # For now, simulate finding links
-        sample_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <a href="https://t.me/sample_channel">Join Channel</a>
-            <a href="https://t.me/another_channel">Another Link</a>
-        </body>
-        </html>
-        """
-        
-        links = extract_telegram_links(sample_html)
-        
-        if user_id not in user_sessions:
-            user_sessions[user_id] = {'files': [], 'state': 'collecting'}
-        
-        user_sessions[user_id]['files'].append({
-            'name': doc['file_name'],
-            'content': sample_html,
-            'links': links
-        })
-        
-        send_message(chat_id, 
-            f"✅ **{doc['file_name']}**\n"
-            f"🔗 Found {len(links)} Telegram buttons\n\n"
-            f"Send more files or type /done to process."
+        else:
+            summary_lines = []
+            for b in edited:
+                summary_lines.append(
+                    f"• *{b['original_text']}* → *{b['new_text']}*\n"
+                    f"  `{b['original_href']}` → `{b['new_href']}`"
+                )
+            summary = "\n".join(summary_lines)
+            await query.edit_message_text(
+                f"📋 *Summary of changes:*\n\n{summary}\n\n"
+                f"Proceed and generate updated file(s)?",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_confirm_keyboard()
+            )
+        return CONFIRMING
+
+    # ── Individual button tapped ──
+    if data.startswith("btn_"):
+        idx = int(data.split("_")[1])
+        if idx >= len(buttons):
+            await query.answer("Invalid button.")
+            return SHOWING_BUTTONS
+
+        btn = buttons[idx]
+        await query.edit_message_text(
+            f"🔘 *Button Details:*\n\n"
+            f"📝 Name : `{btn['new_text']}`\n"
+            f"🔗 Link : `{btn['new_href']}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_edit_keyboard(idx)
+        )
+        return SHOWING_BUTTONS
+
+    # ── Edit Name tapped ──
+    if data.startswith("edit_name_"):
+        idx = int(data.split("_")[2])
+        ctx.user_data["editing_idx"]  = idx
+        ctx.user_data["editing_field"] = "name"
+        await query.edit_message_text(
+            f"✏️ Send the *new name* for this button:\n\n"
+            f"Current name: `{buttons[idx]['new_text']}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return EDITING_NAME
+
+    # ── Edit Link tapped ──
+    if data.startswith("edit_link_"):
+        idx = int(data.split("_")[2])
+        ctx.user_data["editing_idx"]   = idx
+        ctx.user_data["editing_field"] = "link"
+        await query.edit_message_text(
+            f"🔗 Send the *new Telegram link* for this button:\n\n"
+            f"Current link: `{buttons[idx]['new_href']}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return EDITING_LINK
+
+    return SHOWING_BUTTONS
+
+# ─────────────────────────────────────────
+# RECEIVE NEW NAME
+# ─────────────────────────────────────────
+async def receive_new_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    new_name = update.message.text.strip()
+    if not new_name:
+        await update.message.reply_text("⚠️ Name cannot be empty. Please send a valid name.")
+        return EDITING_NAME
+
+    idx     = ctx.user_data.get("editing_idx", 0)
+    buttons = ctx.user_data.get("buttons", [])
+    buttons[idx]["new_text"] = new_name
+
+    await update.message.reply_text(
+        f"✅ Button name updated to: *{new_name}*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await update.message.reply_text(
+        "🔘 *Button List*\nTap any button to view or edit:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_button_list_keyboard(buttons)
+    )
+    return SHOWING_BUTTONS
+
+# ─────────────────────────────────────────
+# RECEIVE NEW LINK
+# ─────────────────────────────────────────
+async def receive_new_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    new_link = update.message.text.strip()
+    is_valid, msg = validate_telegram_link(new_link)
+
+    if not is_valid:
+        await update.message.reply_text(
+            f"{msg}\n\nPlease send a valid Telegram link."
+        )
+        return EDITING_LINK
+
+    idx     = ctx.user_data.get("editing_idx", 0)
+    buttons = ctx.user_data.get("buttons", [])
+    buttons[idx]["new_href"] = new_link
+
+    await update.message.reply_text(
+        f"{msg}\n\nLink updated to:\n`{new_link}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await update.message.reply_text(
+        "🔘 *Button List*\nTap any button to view or edit:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=build_button_list_keyboard(buttons)
+    )
+    return SHOWING_BUTTONS
+
+# ─────────────────────────────────────────
+# CONFIRM — Apply edits and send files
+# ─────────────────────────────────────────
+async def confirm_apply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_no":
+        buttons = ctx.user_data.get("buttons", [])
+        await query.edit_message_text(
+            "🔘 *Button List*\nTap any button to view or edit:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=build_button_list_keyboard(buttons)
+        )
+        return SHOWING_BUTTONS
+
+    # Apply edits
+    files   = ctx.user_data.get("files",   {})
+    buttons = ctx.user_data.get("buttons", [])
+
+    await query.edit_message_text("⏳ Generating your updated file(s)...")
+
+    for filename, html_content in files.items():
+        patched = patch_html(html_content, buttons)
+
+        # Build new filename
+        name_part, ext_part = os.path.splitext(filename)
+        new_filename = f"{name_part}{RENAME_TAG}{ext_part}"
+
+        await query.message.reply_document(
+            document=io.BytesIO(patched.encode("utf-8")),
+            filename=new_filename,
+            caption=f"✅ `{new_filename}` is ready!",
+            parse_mode=ParseMode.MARKDOWN
         )
 
-def get_updates(offset=0):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        if offset:
-            url += f"?offset={offset}"
-        
-        with urlopen(url, timeout=10) as response:
-            return json.loads(response.read().decode())
-    except Exception as e:
-        print(f"❌ Get updates error: {e}")
-        return None
+    await query.message.reply_text(
+        "🎉 All files processed successfully!\n"
+        "Type /start to begin a new session."
+    )
 
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+# ─────────────────────────────────────────
+# TIMEOUT HANDLER
+# ─────────────────────────────────────────
+async def session_timeout(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "⏰ Session expired due to inactivity.\n"
+        "Please type /start to begin again."
+    )
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+# ─────────────────────────────────────────
+# CANCEL
+# ─────────────────────────────────────────
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await owner_only(update):
+        return ConversationHandler.END
+
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        "❌ Session cancelled.\nType /start to begin again."
+    )
+    return ConversationHandler.END
+
+# ─────────────────────────────────────────
+# UNAUTHORIZED FALLBACK
+# ─────────────────────────────────────────
+async def unauthorized(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text(
+            "⛔ Sorry, you are not authorized to use this bot."
+        )
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
 def main():
-    if not BOT_TOKEN or OWNER_ID == 0:
-        print("❌ Config missing!")
-        return
-    
-    print("🚀 Starting HTML Button Editor Bot...")
-    
-    # Start health server
-    Thread(target=run_health, daemon=True).start()
-    
-    # Bot polling
-    offset = 0
-    print("🤖 Bot polling started!")
-    
-    while True:
-        try:
-            result = get_updates(offset)
-            if not result or not result.get('ok'):
-                continue
-            
-            for update in result.get('result', []):
-                if 'message' in update:
-                    handle_message(update['message'])
-                offset = update['update_id'] + 1
-        
-        except KeyboardInterrupt:
-            print("🛑 Bot stopped")
-            break
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            import time
-            time.sleep(5)
+    TIMEOUT_SECONDS = 600  # 10 minutes
 
-if __name__ == '__main__':
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            UPLOADING: [
+                MessageHandler(filters.Document.ALL, receive_file),
+                CommandHandler("done", done_uploading),
+                CommandHandler("help", help_command),
+            ],
+            SHOWING_BUTTONS: [
+                CallbackQueryHandler(button_tapped),
+            ],
+            EDITING_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_name),
+            ],
+            EDITING_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_link),
+            ],
+            CONFIRMING: [
+                CallbackQueryHandler(confirm_apply),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.ALL, session_timeout),
+        ],
+        conversation_timeout=TIMEOUT_SECONDS,
+    )
+
+    app.add_handler(conv_handler)
+
+    # Catch unauthorized users outside conversation
+    app.add_handler(MessageHandler(filters.ALL, unauthorized))
+
+    print("🤖 Bot started polling...")
+    app.run_polling()
+
+if __name__ == "__main__":
     main()
