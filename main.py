@@ -1,697 +1,428 @@
 import os
 import io
 import re
+import requests
+import asyncio
+from bs4 import BeautifulSoup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, ContextTypes, filters
+)
+from telegram.constants import ParseMode
+
+# For Render deployment (no nest_asyncio needed)
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
-import json
-from datetime import datetime
 
-# ======================== CONFIG ========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-RENAME_TAG = os.getenv("RENAME_TAG", "_edited")
-
-print(f"🚀 Advanced HTML Editor Bot")
-print(f"Owner: {OWNER_ID}, Tag: {RENAME_TAG}")
-
-# ======================== HEALTH SERVER ========================
-class Health(BaseHTTPRequestHandler):
+# ======================== HEALTH CHECK (For Render) ========================
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/html')
+        self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        html = f"""
-        <html><body style="font-family:Arial;text-align:center;padding:50px">
-        <h1>🤖 HTML Button Editor Bot</h1>
-        <h2 style="color:green">✅ ACTIVE</h2>
-        <p><strong>Owner:</strong> {OWNER_ID}</p>
-        <p><strong>Features:</strong> All Advanced Features Active</p>
-        </body></html>
-        """
-        self.wfile.write(html.encode())
+        self.wfile.write(b'Bot Running!')
     def log_message(self, *args): pass
 
 def health_server():
-    HTTPServer(('0.0.0.0', int(os.getenv('PORT', 10000))), Health).serve_forever()
+    port = int(os.getenv('PORT', 10000))
+    HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
 
-# ======================== TELEGRAM API ========================
-def api_call(method, data=None):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-        req = Request(url, urlencode(data).encode() if data else None)
-        with urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:
-        print(f"API Error: {e}")
-        return None
+# ======================== CONFIGURATION ========================
+BOT_TOKEN  = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+OWNER_ID   = int(os.getenv("OWNER_ID", "123456789"))
+RENAME_TAG = os.getenv("RENAME_TAG", "_edited")
 
-def send_msg(chat_id, text, keyboard=None):
-    data = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
-    if keyboard:
-        data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
-    return api_call('sendMessage', data)
+print(f"🚀 Bot Starting - Owner: {OWNER_ID}, Tag: {RENAME_TAG}")
 
-def edit_msg(chat_id, msg_id, text, keyboard=None):
-    data = {'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown'}
-    if keyboard:
-        data['reply_markup'] = json.dumps({'inline_keyboard': keyboard})
-    return api_call('editMessageText', data)
+# States
+UPLOADING, SHOWING_MENU, EDITING_NAME_VAL, EDITING_LINK_VAL = range(4)
+SEARCH_OLD_TEXT, REPLACE_NEW_TEXT, GLOBAL_LINK_REPLACE = range(4, 7)
+EDITING_FILENAME, EDITING_TITLE, CONFIRMING = range(7, 10)
 
-def send_doc(chat_id, filename, content, caption=""):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        boundary = '----Boundary7MA4YWxk'
-        
-        parts = [
-            f'--{boundary}\r\n',
-            f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n',
-        ]
-        
-        if caption:
-            parts.extend([
-                f'--{boundary}\r\n',
-                f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n',
-            ])
-        
-        parts.extend([
-            f'--{boundary}\r\n',
-            f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n',
-            f'Content-Type: text/html\r\n\r\n',
-            content,
-            f'\r\n--{boundary}--\r\n'
-        ])
-        
-        body = ''.join(parts).encode('utf-8')
-        
-        req = Request(url, body)
-        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-        
-        with urlopen(req, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:
-        print(f"Doc error: {e}")
-        return None
+TG_PATTERN = re.compile(r'^(?:https?://)?(?:t\.me|telegram\.(?:me|dog))|^tg://', re.I)
 
-def get_file(file_id):
-    try:
-        result = api_call('getFile', {'file_id': file_id})
-        if not result or not result.get('ok'):
-            return None
-        
-        path = result['result']['file_path']
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-        
-        with urlopen(url, timeout=30) as r:
-            return r.read().decode('utf-8', errors='ignore')
-    except Exception as e:
-        print(f"File error: {e}")
-        return None
+# --- Initialization Helper ---
+def init_user_data(ctx):
+    if "files" not in ctx.user_data:
+        ctx.user_data.update({
+            "files": {}, 
+            "btns": [], 
+            "text_map": {}, 
+            "custom_filename": None,
+            "custom_title": None
+        })
 
-# ======================== HTML PROCESSING ========================
-def find_buttons(html):
-    """Extract Telegram buttons from HTML"""
-    buttons = []
-    pattern = r'<a[^>]*href=["\']([^"\']*(?:t\.me|telegram\.me)[^"\']*)["\'][^>]*>(.*?)</a>'
-    
-    seen = set()
-    for link, text in re.findall(pattern, html, re.I | re.S):
-        clean = re.sub(r'<[^>]+>', '', text).strip()
-        clean = re.sub(r'\s+', ' ', clean)
-        
-        if clean and len(clean) > 1:
-            # Normalize link
-            if not link.startswith('http'):
-                link = 'https://' + link.lstrip('/')
-            
-            sig = (clean.lower(), link.lower())
-            if sig not in seen:
-                seen.add(sig)
-                buttons.append({
-                    'orig_txt': clean,
-                    'orig_hr': link,
-                    'new_txt': clean,
-                    'new_hr': link,
-                    'delete': False
-                })
-    
+# --- Logic Functions ---
+async def owner_only(update: Update) -> bool:
+    if update.effective_user.id != OWNER_ID:
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return False
+    return True
+
+def extract_buttons(html):
+    soup = BeautifulSoup(html, "html.parser")
+    seen, buttons = set(), []
+    for a in soup.find_all("a", href=True):
+        if TG_PATTERN.match(a["href"]):
+            txt, hr = a.get_text(strip=True) or "Button", a["href"]
+            if (txt.lower(), hr.lower()) not in seen:
+                seen.add((txt.lower(), hr.lower()))
+                buttons.append({"orig_txt": txt, "orig_hr": hr, "new_txt": txt, "new_hr": hr, "delete": False})
     return buttons
 
 def patch_html(html, buttons, text_map, new_title):
-    """Apply all modifications to HTML"""
-    # 1. Update Page Title
+    soup = BeautifulSoup(html, "html.parser")
+    # 1. Page Title Update
     if new_title:
-        if '<title>' in html:
-            html = re.sub(r'<title>.*?</title>', f'<title>{new_title}</title>', html, flags=re.I | re.S)
-        elif '<head>' in html:
-            html = re.sub(r'<head>', f'<head>\n<title>{new_title}</title>', html, flags=re.I)
+        if soup.title: 
+            soup.title.string = new_title
         else:
-            html = f'<html><head><title>{new_title}</title></head><body>{html}</body></html>'
+            new_tag = soup.new_tag("title")
+            new_tag.string = new_title
+            if soup.head: 
+                soup.head.append(new_tag)
     
-    # 2. Apply Button Changes
+    # 2. Buttons Update
     for b in buttons:
-        old_link_esc = re.escape(b['orig_hr'])
-        old_txt_esc = re.escape(b['orig_txt'])
-        
-        if b['delete']:
-            # Remove button
-            pattern = f'<a[^>]*href=["\'][^"\']*{old_link_esc}[^"\']*["\'][^>]*>.*?</a>'
-            html = re.sub(pattern, '', html, flags=re.I | re.S)
-        else:
-            # Update link
-            html = re.sub(
-                f'href=["\'][^"\']*{old_link_esc}[^"\']*["\']',
-                f'href="{b["new_hr"]}"',
-                html,
-                flags=re.I
-            )
-            
-            # Update text
-            pattern = f'(<a[^>]*href=["\'][^"\']*{re.escape(b["new_hr"])}[^"\']*["\'][^>]*>)[^<]*{old_txt_esc}[^<]*(</a>)'
-            html = re.sub(pattern, f'\\1{b["new_txt"]}\\2', html, flags=re.I)
+        for a in soup.find_all("a", href=True):
+            if a["href"].lower() == b["orig_hr"].lower() and a.get_text(strip=True).lower() == b["orig_txt"].lower():
+                if b["delete"]: 
+                    a.decompose()
+                else:
+                    a["href"] = b["new_hr"]
+                    a.clear()
+                    a.append(b["new_txt"])
     
-    # 3. Apply Custom Text Replacements (with button protection)
-    for old_txt, new_txt in text_map.items():
-        # Find and replace, but skip inside Telegram buttons
-        parts = re.split(r'(<a[^>]*href=["\'][^"\']*(?:t\.me|telegram\.me)[^"\']*["\'][^>]*>.*?</a>)', html, flags=re.I | re.S)
-        
-        for i in range(len(parts)):
-            # Only replace in non-button parts (even indices)
-            if i % 2 == 0:
-                parts[i] = parts[i].replace(old_txt, new_txt)
-        
-        html = ''.join(parts)
+    # 3. Custom Text Update
+    for old, new in text_map.items():
+        target = re.compile(re.escape(old), re.IGNORECASE)
+        for element in soup.find_all(string=target):
+            if element.find_parent("a", href=True) and TG_PATTERN.match(element.find_parent("a")["href"]): 
+                continue
+            element.replace_with(target.sub(new, element))
     
-    return html
+    return str(soup)
 
-# ======================== SESSION DATA ========================
-sessions = {}
+# --- Handlers ---
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update): 
+        return ConversationHandler.END
+    ctx.user_data.clear()
+    init_user_data(ctx)
+    await update.message.reply_text("👋 Hi! Send **.html** files or type /done")
+    return UPLOADING
 
-def get_session(user_id):
-    if user_id not in sessions:
-        sessions[user_id] = {
-            'files': {},           # filename -> html_content
-            'btns': [],            # deduplicated buttons
-            'text_map': {},        # old_text -> new_text
-            'custom_filename': None,
-            'custom_title': None,
-            'state': 'start',
-            'edit_idx': None
-        }
-    return sessions[user_id]
+async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update): 
+        return ConversationHandler.END
+    
+    init_user_data(ctx)
+    doc = update.message.document
+    
+    if not doc or not doc.file_name.lower().endswith(".html"):
+        await update.message.reply_text("❌ Send only .html files.")
+        return UPLOADING
+    
+    try:
+        # Progress message
+        progress_msg = await update.message.reply_text(f"⏳ Downloading `{doc.file_name}`...")
+        
+        # Download with timeout
+        f = await asyncio.wait_for(doc.get_file(), timeout=30)
+        b = await asyncio.wait_for(f.download_as_bytearray(), timeout=60)
+        
+        # Decode
+        html_content = b.decode("utf-8", errors="ignore")
+        
+        # Store
+        ctx.user_data["files"][doc.file_name] = html_content
+        
+        # Update message
+        await progress_msg.edit_text(f"✅ Received {doc.file_name}. More? or /done")
+        
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ Download timeout. File too large or slow connection.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+    
+    return UPLOADING
 
-# ======================== UI HELPERS ========================
-def create_main_menu(session):
-    """Create main menu keyboard"""
-    btns = session['btns']
+async def show_main_menu(update_target, ctx):
+    btns = ctx.user_data["btns"]
+    c_title = ctx.user_data.get("custom_title")
     kb = []
     
-    # Show first 5 buttons
-    for i, b in enumerate(btns[:5]):
-        if b['delete']:
-            status = "🔴"
-            name = f"[DELETED] {b['orig_txt'][:15]}"
-        elif b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr']:
-            status = "🟡"
-            name = b['new_txt'][:15]
-        else:
-            status = "⚪"
-            name = b['orig_txt'][:15]
-        
-        if len(name) > 15:
-            name += "..."
-        
-        kb.append([{'text': f"{status} {name}", 'callback_data': f"b_{i}"}])
-    
-    if len(btns) > 5:
-        kb.append([{'text': f"... and {len(btns) - 5} more buttons", 'callback_data': 'show_all'}])
-    
-    # Global actions
-    kb.append([
-        {'text': '🔗 All Links Replace', 'callback_data': 'global_replace'},
-        {'text': '🔍 Replace Custom Text', 'callback_data': 'find_text'}
-    ])
-    
-    # Branding
-    title_txt = f"Title: {session['custom_title'][:10]}..." if session['custom_title'] else "🏷️ Edit Page Title"
-    fname_txt = f"File: {session['custom_filename'][:10]}..." if session['custom_filename'] else "📁 Rename File"
+    for i, b in enumerate(btns):
+        status = "❌ [DEL]" if b["delete"] else f"🔘 {b['new_txt']}"
+        kb.append([InlineKeyboardButton(status, callback_data=f"b_{i}")])
     
     kb.append([
-        {'text': title_txt, 'callback_data': 'change_title'},
-        {'text': fname_txt, 'callback_data': 'change_filename'}
+        InlineKeyboardButton("🔗 All Links Replace", callback_data="global_replace"), 
+        InlineKeyboardButton("🔍 Replace Custom Text", callback_data="find_text")
     ])
     
-    # Summary
-    edited = len([b for b in btns if (b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr']) and not b['delete']])
-    deleted = len([b for b in btns if b['delete']])
-    texts = len(session['text_map'])
-    
-    kb.append([{'text': f"📊 Changes: {edited}E {deleted}D {texts}T", 'callback_data': 'summary'}])
-    
-    # Final actions
+    t_btn = f"🏷️ Title: {c_title[:15]}..." if c_title else "🏷️ Edit Page Title"
     kb.append([
-        {'text': '🔄 Reset', 'callback_data': 'reset'},
-        {'text': '✅ FINISH & GENERATE', 'callback_data': 'final'}
+        InlineKeyboardButton(t_btn, callback_data="change_title"),
+        InlineKeyboardButton("📁 Rename File", callback_data="change_filename")
     ])
     
-    return kb
+    kb.append([
+        InlineKeyboardButton("🔄 Reset", callback_data="reset"),
+        InlineKeyboardButton("✅ FINISH & GENERATE", callback_data="final")
+    ])
+    
+    msg = "Main Menu: Choose an option to edit your HTML files."
+    
+    if isinstance(update_target, Update): 
+        await update_target.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+    else: 
+        await update_target.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
 
-# ======================== MESSAGE HANDLERS ========================
-def handle_msg(msg):
-    chat = msg['chat']['id']
-    user = msg['from']['id']
+async def done_uploading(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update): 
+        return ConversationHandler.END
     
-    if user != OWNER_ID:
-        send_msg(chat, "🚫 Access Denied")
-        return
+    init_user_data(ctx)
+    files = ctx.user_data.get("files")
     
-    session = get_session(user)
+    if not files: 
+        return UPLOADING
     
-    # Commands
-    if 'text' in msg:
-        text = msg['text'].strip()
-        
-        if text == '/start':
-            session['files'] = {}
-            session['btns'] = []
-            session['text_map'] = {}
-            session['custom_filename'] = None
-            session['custom_title'] = None
-            session['state'] = 'uploading'
-            
-            send_msg(chat,
-                "🚀 **Advanced HTML Button Editor**\n\n"
-                "🎯 **Features:**\n"
-                "• 🟢 Interactive editing\n"
-                "• 🔵 Batch processing\n"
-                "• 🟡 Smart deduplication\n"
-                "• 🔴 Custom branding\n\n"
-                "📤 **Send .html files**\n"
-                "📋 **Type /done when ready**"
-            )
-        
-        elif text == '/help':
-            send_msg(chat,
-                "📘 **Complete Guide:**\n\n"
-                "**1. Individual Editing**\n"
-                "• Edit button names\n"
-                "• Change links\n"
-                "• Delete buttons\n\n"
-                "**2. Global Actions**\n"
-                "• Replace all links at once\n"
-                "• Custom text find & replace\n\n"
-                "**3. Branding**\n"
-                "• Set page title\n"
-                "• Custom filename\n\n"
-                "**4. Smart Features**\n"
-                "• Auto-deduplication\n"
-                "• Button name protection\n"
-                "• Summary reports"
-            )
-        
-        elif text == '/done':
-            if not session['files']:
-                send_msg(chat, "⚠️ No files uploaded")
-                return
-            
-            send_msg(chat, "🔄 Processing files...")
-            
-            # Extract and deduplicate
-            all_btns = []
-            seen = set()
-            
-            for fname, html in session['files'].items():
-                btns = find_buttons(html)
-                for b in btns:
-                    sig = (b['orig_txt'].lower(), b['orig_hr'].lower())
-                    if sig not in seen:
-                        seen.add(sig)
-                        all_btns.append(b)
-            
-            session['btns'] = all_btns
-            session['state'] = 'editing'
-            
-            send_msg(chat,
-                f"✅ **Processing complete!**\n"
-                f"📁 Files: {len(session['files'])}\n"
-                f"🔗 Buttons: {len(all_btns)}"
-            )
-            
-            show_main_menu(chat, user)
-        
-        # Handle various text inputs
-        elif session['state'] == 'edit_name':
-            idx = session.get('edit_idx')
-            if idx is not None and idx < len(session['btns']):
-                session['btns'][idx]['new_txt'] = text
-                send_msg(chat, f"✅ Name updated: `{text}`")
-                session['state'] = 'editing'
-                show_main_menu(chat, user)
-        
-        elif session['state'] == 'edit_link':
-            if 't.me' not in text.lower() and 'telegram.me' not in text.lower():
-                send_msg(chat, "❌ Invalid Telegram link")
-                return
-            
-            idx = session.get('edit_idx')
-            if idx is not None and idx < len(session['btns']):
-                session['btns'][idx]['new_hr'] = text
-                send_msg(chat, f"✅ Link updated: `{text}`")
-                session['state'] = 'editing'
-                show_main_menu(chat, user)
-        
-        elif session['state'] == 'global_link':
-            if 't.me' not in text.lower() and 'telegram.me' not in text.lower():
-                send_msg(chat, "❌ Invalid Telegram link")
-                return
-            
-            count = 0
-            for b in session['btns']:
-                if not b['delete']:
-                    b['new_hr'] = text
-                    count += 1
-            
-            send_msg(chat, f"✅ Updated {count} buttons to:\n`{text}`")
-            session['state'] = 'editing'
-            show_main_menu(chat, user)
-        
-        elif session['state'] == 'find_text':
-            session['temp_old'] = text
-            session['state'] = 'replace_text'
-            send_msg(chat, f"🔍 Find: `{text}`\n\n📝 Now send replacement text:")
-        
-        elif session['state'] == 'replace_text':
-            old = session.pop('temp_old', '')
-            if old:
-                session['text_map'][old] = text
-                send_msg(chat,
-                    f"✅ **Text replacement added:**\n"
-                    f"📍 Find: `{old}`\n"
-                    f"📍 Replace: `{text}`\n\n"
-                    f"🛡️ Button names are protected"
-                )
-            session['state'] = 'editing'
-            show_main_menu(chat, user)
-        
-        elif session['state'] == 'custom_title':
-            session['custom_title'] = text
-            send_msg(chat, f"✅ Page title set: `{text}`")
-            session['state'] = 'editing'
-            show_main_menu(chat, user)
-        
-        elif session['state'] == 'custom_filename':
-            # Clean filename
-            fname = re.sub(r'[^\w\-_]', '', text.replace(' ', '_'))
-            session['custom_filename'] = fname
-            send_msg(chat, f"✅ Filename set: `{fname}{RENAME_TAG}.html`")
-            session['state'] = 'editing'
-            show_main_menu(chat, user)
+    all_btns, seen = [], set()
     
-    # Files
-    elif 'document' in msg:
-        doc = msg['document']
-        
-        if not doc['file_name'].lower().endswith(('.html', '.htm')):
-            send_msg(chat, "❌ HTML files only")
-            return
-        
-        send_msg(chat, f"⏳ Downloading `{doc['file_name']}`...")
-        
-        html = get_file(doc['file_id'])
-        if html:
-            session['files'][doc['file_name']] = html
-            btns = find_buttons(html)
-            
-            send_msg(chat,
-                f"✅ **{doc['file_name']}**\n"
-                f"📊 Found: {len(btns)} buttons\n"
-                f"📁 Total: {len(session['files'])} files\n\n"
-                f"Send more or /done"
-            )
-        else:
-            send_msg(chat, "❌ Download failed. Try again.")
+    for content in files.values():
+        for b in extract_buttons(content):
+            if (b["orig_txt"].lower(), b["orig_hr"].lower()) not in seen:
+                seen.add((b["orig_txt"].lower(), b["orig_hr"].lower()))
+                all_btns.append(b)
+    
+    ctx.user_data["btns"] = all_btns
+    await show_main_menu(update, ctx)
+    return SHOWING_MENU
 
-def show_main_menu(chat, user):
-    session = get_session(user)
+async def menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    init_user_data(ctx)
     
-    text = (
-        f"🎛️ **HTML Editor Control Panel**\n\n"
-        f"📋 **Current Session:**\n"
-        f"• Files: {len(session['files'])}\n"
-        f"• Buttons: {len(session['btns'])}\n\n"
-        f"🎯 **Choose option:**"
-    )
-    
-    kb = create_main_menu(session)
-    send_msg(chat, text, kb)
-
-def handle_callback(cb):
-    chat = cb['message']['chat']['id']
-    user = cb['from']['id']
-    data = cb['data']
-    msg_id = cb['message']['message_id']
-    
-    if user != OWNER_ID:
-        return
-    
-    session = get_session(user)
-    
-    if data.startswith('b_'):
-        # Edit button
-        idx = int(data.split('_')[1])
-        session['edit_idx'] = idx
-        
-        b = session['btns'][idx]
-        status = "🗑️ DELETED" if b['delete'] else ("✏️ MODIFIED" if b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr'] else "📋 ORIGINAL")
-        
-        kb = [
-            [
-                {'text': '✏️ Edit Name', 'callback_data': 'edit_name'},
-                {'text': '🔗 Edit Link', 'callback_data': 'edit_link'}
-            ],
-            [{'text': '🗑️ Toggle Delete', 'callback_data': 'delete_btn'}],
-            [{'text': '⬅️ Back', 'callback_data': 'back'}]
-        ]
-        
-        edit_msg(chat, msg_id,
-            f"🔘 **Button Editor**\n\n"
-            f"**Status:** {status}\n"
-            f"**Name:** `{b['new_txt']}`\n"
-            f"**Link:** `{b['new_hr']}`\n\n"
-            f"🎯 **Choose action:**",
-            kb
-        )
-    
-    elif data == 'edit_name':
-        session['state'] = 'edit_name'
-        edit_msg(chat, msg_id, "✏️ **Send new button name:**")
-    
-    elif data == 'edit_link':
-        session['state'] = 'edit_link'
-        edit_msg(chat, msg_id, "🔗 **Send new Telegram link:**")
-    
-    elif data == 'delete_btn':
-        idx = session.get('edit_idx')
-        if idx is not None:
-            b = session['btns'][idx]
-            b['delete'] = not b['delete']
-            action = "marked for deletion" if b['delete'] else "restored"
-            send_msg(chat, f"✅ Button {action}")
-            show_main_menu(chat, user)
-    
-    elif data == 'global_replace':
-        session['state'] = 'global_link'
-        edit_msg(chat, msg_id,
-            "🔗 **Global Link Replacement**\n\n"
-            "⚠️ This will replace ALL Telegram links\n\n"
-            "📝 Send the new link:"
-        )
-    
-    elif data == 'find_text':
-        session['state'] = 'find_text'
-        edit_msg(chat, msg_id,
-            "🔍 **Custom Text Replacement**\n\n"
-            "🛡️ Button names are protected\n\n"
-            "📝 Send text to find:"
-        )
-    
-    elif data == 'change_title':
-        session['state'] = 'custom_title'
-        edit_msg(chat, msg_id,
-            "🏷️ **Edit Page Title**\n\n"
-            "This will be the browser tab title\n\n"
-            "📝 Send new title:"
-        )
-    
-    elif data == 'change_filename':
-        session['state'] = 'custom_filename'
-        edit_msg(chat, msg_id,
-            f"📁 **Custom Filename**\n\n"
-            f"Suffix `{RENAME_TAG}` will be added\n\n"
-            f"📝 Send filename (without .html):"
-        )
-    
-    elif data == 'reset':
-        # Reset all changes
-        for b in session['btns']:
-            b['new_txt'] = b['orig_txt']
-            b['new_hr'] = b['orig_hr']
-            b['delete'] = False
-        
-        session['text_map'] = {}
-        session['custom_filename'] = None
-        session['custom_title'] = None
-        
-        send_msg(chat, "♻️ **All changes reset**")
-        show_main_menu(chat, user)
-    
-    elif data == 'summary':
-        # Show detailed summary
-        btns = session['btns']
-        edited = len([b for b in btns if (b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr']) and not b['delete']])
-        deleted = len([b for b in btns if b['delete']])
+    if query.data == "final":
+        # Calculate Summary
+        btns = ctx.user_data["btns"]
+        edited_b = len([b for b in btns if (b["new_txt"] != b["orig_txt"] or b["new_hr"] != b["orig_hr"]) and not b["delete"]])
+        deleted_b = len([b for b in btns if b["delete"]])
+        texts = len(ctx.user_data["text_map"])
         
         summary = (
-            f"📊 **Detailed Summary**\n\n"
-            f"📁 **Files:** {len(session['files'])}\n"
-            f"🔗 **Total Buttons:** {len(btns)}\n"
-            f"✏️ **Edited:** {edited}\n"
-            f"🗑️ **Deleted:** {deleted}\n"
-            f"📝 **Text Replacements:** {len(session['text_map'])}\n"
+            f"📊 **Project Summary:**\n"
+            f"• Files: {len(ctx.user_data['files'])}\n"
+            f"• Buttons Edited: {edited_b}\n"
+            f"• Buttons Deleted: {deleted_b}\n"
+            f"• Text Replaced: {texts}\n"
+            f"• New Title: {'Yes' if ctx.user_data['custom_title'] else 'No'}\n\n"
+            f"Apply and generate?"
         )
         
-        if session['custom_title']:
-            summary += f"🏷️ **Title:** {session['custom_title'][:30]}\n"
-        
-        if session['custom_filename']:
-            summary += f"📁 **Filename:** {session['custom_filename']}\n"
-        
-        kb = [[{'text': '⬅️ Back', 'callback_data': 'back'}]]
-        edit_msg(chat, msg_id, summary, kb)
+        await query.edit_message_text(
+            summary, 
+            parse_mode=ParseMode.MARKDOWN, 
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Yes, Go!", callback_data="y"), 
+                InlineKeyboardButton("No", callback_data="n")
+            ]])
+        )
+        return CONFIRMING
     
-    elif data == 'final':
-        # Show confirmation
-        btns = session['btns']
-        edited = len([b for b in btns if (b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr']) and not b['delete']])
-        deleted = len([b for b in btns if b['delete']])
-        
-        confirm = (
-            f"📊 **Final Generation Summary**\n\n"
-            f"📁 Files: {len(session['files'])}\n"
-            f"✏️ Buttons Edited: {edited}\n"
-            f"🗑️ Buttons Deleted: {deleted}\n"
-            f"📝 Text Replaced: {len(session['text_map'])}\n"
-            f"🏷️ Custom Title: {'Yes' if session['custom_title'] else 'No'}\n"
-            f"📁 Custom Filename: {'Yes' if session['custom_filename'] else 'No'}\n\n"
-            f"🚀 **Ready to generate?**"
-        )
-        
-        kb = [
-            [
-                {'text': '✅ Yes, Generate!', 'callback_data': 'confirm_yes'},
-                {'text': '❌ No', 'callback_data': 'confirm_no'}
-            ]
+    if query.data == "reset":
+        for b in ctx.user_data["btns"]: 
+            b["new_txt"], b["new_hr"], b["delete"] = b["orig_txt"], b["orig_hr"], False
+        ctx.user_data.update({"text_map": {}, "custom_filename": None, "custom_title": None})
+        await query.message.reply_text("🔄 Edits Reset.")
+        await show_main_menu(query, ctx)
+        return SHOWING_MENU
+    
+    if query.data == "change_title":
+        await query.edit_message_text("🏷️ Send the **New Page Title** (Browser Tab Name):")
+        return EDITING_TITLE
+    
+    if query.data == "change_filename":
+        await query.edit_message_text("📁 Send the **New Filename** (Suffix will be added):")
+        return EDITING_FILENAME
+    
+    if query.data == "global_replace":
+        await query.edit_message_text("🔗 Send NEW LINK for ALL buttons:")
+        return GLOBAL_LINK_REPLACE
+    
+    if query.data == "find_text":
+        await query.edit_message_text("🔍 Word to find:")
+        return SEARCH_OLD_TEXT
+    
+    if query.data == "back":
+        await show_main_menu(query, ctx)
+        return SHOWING_MENU
+    
+    idx = int(query.data.split("_")[1])
+    ctx.user_data["edit_idx"] = idx
+    b = ctx.user_data["btns"][idx]
+    
+    kb = [
+        [
+            InlineKeyboardButton("✏️ Name", callback_data="edit_name"), 
+            InlineKeyboardButton("🔗 Link", callback_data="edit_link")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Delete", callback_data="delete_btn"), 
+            InlineKeyboardButton("⬅️ Back", callback_data="back")
         ]
-        
-        edit_msg(chat, msg_id, confirm, kb)
+    ]
     
-    elif data == 'confirm_yes':
-        # Generate files
-        edit_msg(chat, msg_id, "⚡ **Generating files...**")
-        
-        files = session['files']
-        btns = session['btns']
-        text_map = session['text_map']
-        custom_title = session['custom_title']
-        custom_fname = session['custom_filename']
-        
-        for i, (orig_name, html) in enumerate(files.items(), 1):
-            # Apply all changes
-            new_html = patch_html(html, btns, text_map, custom_title)
-            
-            # Generate filename
-            if custom_fname:
-                if len(files) > 1:
-                    fname = f"{custom_fname}_{i}{RENAME_TAG}.html"
-                else:
-                    fname = f"{custom_fname}{RENAME_TAG}.html"
-            else:
-                base = orig_name.replace('.html', '').replace('.htm', '')
-                fname = f"{base}{RENAME_TAG}.html"
-            
-            # Send file
-            send_doc(chat, fname, new_html, f"✅ Processed: {orig_name}")
-        
-        # Final summary
-        edited = len([b for b in btns if (b['new_txt'] != b['orig_txt'] or b['new_hr'] != b['orig_hr']) and not b['delete']])
-        deleted = len([b for b in btns if b['delete']])
-        
-        send_msg(chat,
-            f"🎉 **Generation Complete!**\n\n"
-            f"📊 **Final Stats:**\n"
-            f"• Files: {len(files)}\n"
-            f"• Edited: {edited}\n"
-            f"• Deleted: {deleted}\n"
-            f"• Text Replaced: {len(text_map)}\n\n"
-            f"💾 **All files ready!**\n\n"
-            f"🔄 /start for new session"
-        )
-        
-        # Clear session
-        sessions[user] = {
-            'files': {}, 'btns': [], 'text_map': {},
-            'custom_filename': None, 'custom_title': None,
-            'state': 'start', 'edit_idx': None
-        }
-    
-    elif data == 'confirm_no':
-        send_msg(chat, "❌ Generation cancelled")
-        show_main_menu(chat, user)
-    
-    elif data == 'back':
-        show_main_menu(chat, user)
+    await query.edit_message_text(
+        f"Button: {b['new_txt']}\nLink: {b['new_hr']}", 
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return SHOWING_MENU
 
-# ======================== MAIN LOOP ========================
+async def button_sub_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx, btns = ctx.user_data["edit_idx"], ctx.user_data["btns"]
+    
+    if query.data == "delete_btn":
+        btns[idx]["delete"] = not btns[idx]["delete"]
+        await show_main_menu(query, ctx)
+        return SHOWING_MENU
+    
+    if query.data == "edit_name":
+        await query.edit_message_text("New Name?")
+        return EDITING_NAME_VAL
+    
+    if query.data == "edit_link":
+        await query.edit_message_text("New Link?")
+        return EDITING_LINK_VAL
+    
+    return SHOWING_MENU
+
+async def handle_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["custom_title"] = update.message.text.strip()
+    await update.message.reply_text(f"✅ Title set to: {ctx.user_data['custom_title']}")
+    await show_main_menu(update, ctx)
+    return SHOWING_MENU
+
+async def handle_filename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["custom_filename"] = update.message.text.strip().replace(" ", "_")
+    await update.message.reply_text(f"✅ Filename set.")
+    await show_main_menu(update, ctx)
+    return SHOWING_MENU
+
+async def handle_val_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip()
+    idx, btns = ctx.user_data["edit_idx"], ctx.user_data["btns"]
+    
+    if ctx.user_data.get("state_ref") == "name": 
+        btns[idx]["new_txt"] = val
+    else: 
+        btns[idx]["new_hr"] = val
+    
+    await show_main_menu(update, ctx)
+    return SHOWING_MENU
+
+async def handle_global_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    val = update.message.text.strip()
+    
+    if TG_PATTERN.match(val):
+        for b in ctx.user_data["btns"]: 
+            b["new_hr"] = val
+        await update.message.reply_text("✅ Updated.")
+        await show_main_menu(update, ctx)
+        return SHOWING_MENU
+
+async def handle_search_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["temp_old"] = update.message.text.strip()
+    await update.message.reply_text("Replacement?")
+    return REPLACE_NEW_TEXT
+
+async def handle_replace_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["text_map"][ctx.user_data.pop("temp_old")] = update.message.text.strip()
+    await update.message.reply_text("✅ Saved.")
+    await show_main_menu(update, ctx)
+    return SHOWING_MENU
+
+async def final_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "y":
+        await query.edit_message_text("⏳ Processing...")
+        
+        c_name = ctx.user_data.get("custom_filename")
+        c_title = ctx.user_data.get("custom_title")
+        files = ctx.user_data["files"]
+        
+        for i, (orig_name, content) in enumerate(files.items(), 1):
+            out = patch_html(content, ctx.user_data["btns"], ctx.user_data["text_map"], c_title)
+            base = f"{c_name}_{i}" if c_name and len(files) > 1 else (c_name or os.path.splitext(orig_name)[0])
+            
+            await query.message.reply_document(
+                document=io.BytesIO(out.encode()), 
+                filename=f"{base}{RENAME_TAG}.html"
+            )
+        
+        await query.message.reply_text("🎉 Finished!")
+    else: 
+        await query.message.reply_text("Cancelled.")
+    
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+# --- Application ---
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
-        print("❌ Set BOT_TOKEN!")
-        return
-    
-    if OWNER_ID == 0:
-        print("❌ Set OWNER_ID!")
-        return
-    
-    print("Starting health server...")
+    # Start health server for Render
     Thread(target=health_server, daemon=True).start()
     
-    print("🤖 Advanced Bot Ready!")
-    print("Features: All Original Features Active")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    offset = 0
-    while True:
-        try:
-            result = api_call('getUpdates', {'offset': offset, 'timeout': 30})
-            
-            if result and result.get('ok'):
-                for upd in result.get('result', []):
-                    try:
-                        if 'message' in upd:
-                            handle_msg(upd['message'])
-                        elif 'callback_query' in upd:
-                            handle_callback(upd['callback_query'])
-                    except Exception as e:
-                        print(f"Handler error: {e}")
-                    
-                    offset = upd['update_id'] + 1
-        
-        except KeyboardInterrupt:
-            print("Bot stopped")
-            break
-        except Exception as e:
-            print(f"Loop error: {e}")
-            import time
-            time.sleep(3)
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("start", start), MessageHandler(filters.Document.ALL, receive_file)],
+        states={
+            UPLOADING: [
+                MessageHandler(filters.Document.ALL, receive_file), 
+                CommandHandler("done", done_uploading)
+            ],
+            SHOWING_MENU: [
+                CallbackQueryHandler(menu_click, pattern="^(final|reset|global_replace|find_text|back|change_filename|change_title|b_.*)$"), 
+                CallbackQueryHandler(button_sub_click, pattern="^(delete_btn|edit_name|edit_link)$")
+            ],
+            EDITING_NAME_VAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: (c.user_data.update({"state_ref": "name"}), handle_val_edit(u, c))[1])
+            ],
+            EDITING_LINK_VAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: (c.user_data.update({"state_ref": "link"}), handle_val_edit(u, c))[1])
+            ],
+            SEARCH_OLD_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_text)
+            ],
+            REPLACE_NEW_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_replace_text)
+            ],
+            GLOBAL_LINK_REPLACE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_link)
+            ],
+            EDITING_FILENAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filename)
+            ],
+            EDITING_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_title)
+            ],
+            CONFIRMING: [
+                CallbackQueryHandler(final_finish)
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)]
+    ))
+    
+    print("🤖 Bot Ready! Starting polling...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
