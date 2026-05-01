@@ -12,6 +12,12 @@ from telegram.constants import ParseMode
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --- PATCH FOR PYTHON 3.14 COMPATIBILITY ---
+import telegram.ext._updater
+if not hasattr(telegram.ext._updater.Updater, '__dict__'):
+    setattr(telegram.ext._updater.Updater, '__dict__', {})
+# ------------------------------------------
+
 # ======================== HEALTH CHECK ========================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -26,11 +32,11 @@ def health_server():
     HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
 
 # ======================== CONFIGURATION ========================
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-OWNER_ID   = int(os.getenv("OWNER_ID", "123456789"))
+BOT_TOKEN  = os.getenv("BOT_TOKEN", "8669458740:AAHfxHp0IGcUqDfBBwX9jTfa80fcf83EJIQ")
+OWNER_ID   = int(os.getenv("OWNER_ID", "6763842898"))
 RENAME_TAG = os.getenv("RENAME_TAG", "_edited")
 
-print(f"🚀 Bot Starting - Owner: {OWNER_ID}, Tag: {RENAME_TAG}")
+print(f"🚀 Bot Starting - Owner: {OWNER_ID}")
 
 UPLOADING, SHOWING_MENU, EDITING_NAME_VAL, EDITING_LINK_VAL = range(4)
 SEARCH_OLD_TEXT, REPLACE_NEW_TEXT, GLOBAL_LINK_REPLACE = range(4, 7)
@@ -84,7 +90,6 @@ def patch_html(html, buttons, text_map, new_title):
         for element in soup.find_all(string=target):
             if element.find_parent("a", href=True) and TG_PATTERN.match(element.find_parent("a")["href"]): continue
             element.replace_with(target.sub(new, element))
-    
     return str(soup)
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -106,8 +111,6 @@ async def receive_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         b = await asyncio.wait_for(f.download_as_bytearray(), timeout=60)
         ctx.user_data["files"][doc.file_name] = b.decode("utf-8", errors="ignore")
         await progress_msg.edit_text(f"✅ Received {doc.file_name}. More? or /done")
-    except asyncio.TimeoutError:
-        await update.message.reply_text("❌ Download timeout.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
     return UPLOADING
@@ -118,15 +121,14 @@ async def show_main_menu(update_target, ctx):
         status = "❌ [DEL]" if b["delete"] else f"🔘 {b['new_txt']}"
         kb.append([InlineKeyboardButton(status, callback_data=f"b_{i}")])
     
-    kb.append([InlineKeyboardButton("🔗 All Links Replace", callback_data="global_replace"), 
-               InlineKeyboardButton("🔍 Replace Custom Text", callback_data="find_text")])
-    t_btn = f"🏷️ Title: {c_title[:15]}..." if c_title else "🏷️ Edit Page Title"
-    kb.append([InlineKeyboardButton(t_btn, callback_data="change_title"),
+    kb.append([InlineKeyboardButton("🔗 Global Replace", callback_data="global_replace"), 
+               InlineKeyboardButton("🔍 Custom Text", callback_data="find_text")])
+    kb.append([InlineKeyboardButton("🏷️ Page Title", callback_data="change_title"),
                InlineKeyboardButton("📁 Rename File", callback_data="change_filename")])
     kb.append([InlineKeyboardButton("🔄 Reset", callback_data="reset"),
-               InlineKeyboardButton("✅ FINISH & GENERATE", callback_data="final")])
+               InlineKeyboardButton("✅ FINISH", callback_data="final")])
     
-    msg = "Main Menu: Choose an option to edit your HTML files."
+    msg = "Choose an option to edit your HTML files."
     if isinstance(update_target, Update): 
         await update_target.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb))
     else: 
@@ -146,26 +148,21 @@ async def done_uploading(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SHOWING_MENU
 
 async def menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); init_user_data(ctx)
+    query = update.callback_query; await query.answer()
     if query.data == "final":
-        btns = ctx.user_data["btns"]
-        edited_b = len([b for b in btns if (b["new_txt"] != b["orig_txt"] or b["new_hr"] != b["orig_hr"]) and not b["delete"]])
-        deleted_b = len([b for b in btns if b["delete"]])
-        texts = len(ctx.user_data["text_map"])
-        summary = f"📊 **Project Summary:**\n• Files: {len(ctx.user_data['files'])}\n• Buttons Edited: {edited_b}\n• Buttons Deleted: {deleted_b}\n• Text Replaced: {texts}\n• New Title: {'Yes' if ctx.user_data['custom_title'] else 'No'}\n\nApply and generate?"
+        summary = f"📊 **Files:** {len(ctx.user_data['files'])}\nApply edits and generate?"
         await query.edit_message_text(summary, parse_mode=ParseMode.MARKDOWN, 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yes, Go!", callback_data="y"), InlineKeyboardButton("No", callback_data="n")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="y"), InlineKeyboardButton("No", callback_data="n")]]))
         return CONFIRMING
     if query.data == "reset":
-        for b in ctx.user_data["btns"]: b["new_txt"], b["new_hr"], b["delete"] = b["orig_txt"], b["orig_hr"], False
-        ctx.user_data.update({"text_map": {}, "custom_filename": None, "custom_title": None})
-        await query.message.reply_text("🔄 Edits Reset."); await show_main_menu(query, ctx); return SHOWING_MENU
+        ctx.user_data.clear(); init_user_data(ctx)
+        await query.message.reply_text("🔄 Reset Done."); return ConversationHandler.END
     if query.data == "change_title":
-        await query.edit_message_text("🏷️ Send the **New Page Title**:"); return EDITING_TITLE
+        await query.edit_message_text("🏷️ Send New Page Title:"); return EDITING_TITLE
     if query.data == "change_filename":
-        await query.edit_message_text("📁 Send the **New Filename**:"); return EDITING_FILENAME
+        await query.edit_message_text("📁 Send New Filename:"); return EDITING_FILENAME
     if query.data == "global_replace":
-        await query.edit_message_text("🔗 Send NEW LINK for ALL buttons:"); return GLOBAL_LINK_REPLACE
+        await query.edit_message_text("🔗 Send NEW LINK for all buttons:"); return GLOBAL_LINK_REPLACE
     if query.data == "find_text":
         await query.edit_message_text("🔍 Word to find:"); return SEARCH_OLD_TEXT
     if query.data == "back":
@@ -174,7 +171,7 @@ async def menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     idx = int(query.data.split("_")[1]); ctx.user_data["edit_idx"] = idx; b = ctx.user_data["btns"][idx]
     kb = [[InlineKeyboardButton("✏️ Name", callback_data="edit_name"), InlineKeyboardButton("🔗 Link", callback_data="edit_link")],
           [InlineKeyboardButton("🗑️ Delete", callback_data="delete_btn"), InlineKeyboardButton("⬅️ Back", callback_data="back")]]
-    await query.edit_message_text(f"Button: {b['new_txt']}\nLink: {b['new_hr']}", reply_markup=InlineKeyboardMarkup(kb))
+    await query.edit_message_text(f"Edit: {b['new_txt']}", reply_markup=InlineKeyboardMarkup(kb))
     return SHOWING_MENU
 
 async def button_sub_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -190,11 +187,11 @@ async def button_sub_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["custom_title"] = update.message.text.strip()
-    await update.message.reply_text(f"✅ Title set"); await show_main_menu(update, ctx); return SHOWING_MENU
+    await show_main_menu(update, ctx); return SHOWING_MENU
 
 async def handle_filename(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["custom_filename"] = update.message.text.strip().replace(" ", "_")
-    await update.message.reply_text(f"✅ Filename set"); await show_main_menu(update, ctx); return SHOWING_MENU
+    ctx.user_data["custom_filename"] = update.message.text.strip()
+    await show_main_menu(update, ctx); return SHOWING_MENU
 
 async def handle_val_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip(); idx, btns = ctx.user_data["edit_idx"], ctx.user_data["btns"]
@@ -204,9 +201,8 @@ async def handle_val_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_global_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
-    if TG_PATTERN.match(val):
-        for b in ctx.user_data["btns"]: b["new_hr"] = val
-        await update.message.reply_text("✅ Updated"); await show_main_menu(update, ctx); return SHOWING_MENU
+    for b in ctx.user_data["btns"]: b["new_hr"] = val
+    await show_main_menu(update, ctx); return SHOWING_MENU
 
 async def handle_search_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["temp_old"] = update.message.text.strip()
@@ -214,7 +210,7 @@ async def handle_search_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_replace_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["text_map"][ctx.user_data.pop("temp_old")] = update.message.text.strip()
-    await update.message.reply_text("✅ Saved"); await show_main_menu(update, ctx); return SHOWING_MENU
+    await show_main_menu(update, ctx); return SHOWING_MENU
 
 async def final_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -225,23 +221,14 @@ async def final_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             out = patch_html(content, ctx.user_data["btns"], ctx.user_data["text_map"], c_title)
             base = f"{c_name}_{i}" if c_name and len(files) > 1 else (c_name or os.path.splitext(orig_name)[0])
             await query.message.reply_document(document=io.BytesIO(out.encode()), filename=f"{base}{RENAME_TAG}.html")
-        await query.message.reply_text("🎉 Finished!")
-    else: await query.message.reply_text("Cancelled.")
+        await query.message.reply_text("🎉 Done!")
     ctx.user_data.clear(); return ConversationHandler.END
 
 async def post_init(application):
-    """Clean startup - delete webhook and pending updates"""
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Webhook cleared, old instances terminated")
-    except Exception as e:
-        print(f"⚠️ Cleanup: {e}")
+    await application.bot.delete_webhook(drop_pending_updates=True)
 
 def main():
-    print("Starting health server...")
     Thread(target=health_server, daemon=True).start()
-    
-    print("Building application with cleanup...")
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
     app.add_handler(ConversationHandler(
@@ -262,9 +249,7 @@ def main():
         fallbacks=[CommandHandler("start", start)],
         per_message=False
     ))
-    
-    print("🤖 Bot Ready! Clearing conflicts and starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
