@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
@@ -22,7 +23,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'HTML Editor Bot with Inline Buttons!')
+        self.wfile.write(b'HTML Editor Bot with Real File Sending!')
     def log_message(self, *args): pass
 
 def run_health():
@@ -49,6 +50,61 @@ def send_message(chat_id, text, reply_markup=None):
             return json.loads(response.read().decode())
     except Exception as e:
         print(f"❌ Send error: {e}")
+        return None
+
+def send_document_file(chat_id, filename, content, caption=""):
+    """Send actual HTML file to user"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        
+        # Create multipart form data
+        boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+        
+        # Prepare form data
+        form_data = []
+        
+        # Add chat_id
+        form_data.append(f'--{boundary}')
+        form_data.append('Content-Disposition: form-data; name="chat_id"')
+        form_data.append('')
+        form_data.append(str(chat_id))
+        
+        # Add caption if provided
+        if caption:
+            form_data.append(f'--{boundary}')
+            form_data.append('Content-Disposition: form-data; name="caption"')
+            form_data.append('')
+            form_data.append(caption)
+        
+        # Add document
+        form_data.append(f'--{boundary}')
+        form_data.append(f'Content-Disposition: form-data; name="document"; filename="{filename}"')
+        form_data.append('Content-Type: text/html')
+        form_data.append('')
+        form_data.append(content)
+        form_data.append(f'--{boundary}--')
+        
+        # Join with CRLF
+        body = '\r\n'.join(form_data)
+        
+        # Create request
+        req = Request(url, data=body.encode('utf-8'))
+        req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+        
+        with urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode())
+            print(f"✅ File sent: {filename}")
+            return result
+            
+    except Exception as e:
+        print(f"❌ Document send error: {e}")
+        
+        # Fallback: Send as text if file sending fails
+        send_message(chat_id, 
+            f"❌ **File sending failed. Here's the content:**\n\n"
+            f"📄 **{filename}**\n\n"
+            f"```html\n{content[:3000]}{'...' if len(content) > 3000 else ''}\n```"
+        )
         return None
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
@@ -162,6 +218,8 @@ def apply_changes(html_content, changes):
     for button_idx, new_name, new_link in changes:
         if 0 <= button_idx < len(buttons):
             old_name, old_link = buttons[button_idx]
+            
+            print(f"🔧 Applying: {old_name} -> {new_name}")
             
             # Escape for regex
             old_name_escaped = re.escape(old_name)
@@ -322,7 +380,7 @@ def handle_message(message):
                 "🚀 **HTML Button Editor Bot**\n\n"
                 "📤 **Send me an HTML file** with Telegram buttons.\n"
                 "🔍 I'll show them as **clickable buttons** for easy editing.\n"
-                "✏️ Click → Edit → Generate!\n\n"
+                "✏️ Click → Edit → Generate actual file!\n\n"
                 "📋 **Commands:**\n"
                 "/help - Usage guide\n"
                 "/cancel - Cancel session"
@@ -334,10 +392,10 @@ def handle_message(message):
                 "1️⃣ **Upload** HTML file with Telegram links\n"
                 "2️⃣ **Click** any button to edit it\n"
                 "3️⃣ **Send** new details as: `Name | Link`\n"
-                "4️⃣ **Generate** updated file when done\n\n"
+                "4️⃣ **Download** actual updated HTML file\n\n"
                 "**Edit Format:**\n"
                 "`Premium Channel | https://t.me/premium`\n\n"
-                "✅ **Visual, fast, and easy!**"
+                "✅ **Get real files, not just text!**"
             )
         
         elif text.startswith('/cancel'):
@@ -521,26 +579,31 @@ def handle_callback_query(callback_query):
         # Apply changes
         updated_html = apply_changes(session['html_content'], session['changes'])
         
-        # Generate filename
-        base_name = session['filename'].replace('.html', '').replace('.htm', '')
-        new_filename = f"{base_name}{RENAME_TAG}.html"
+        # Generate clean filename
+        original_filename = session['filename']
+        base_name = original_filename.replace('.html', '').replace('.htm', '')
         
-        # Send file content
-        if len(updated_html) > 3000:
-            preview = updated_html[:3000] + "\n\n... (file truncated for display)"
-        else:
-            preview = updated_html
+        # Clean filename for special characters
+        import re
+        clean_base = re.sub(r'[^\w\-_\.]', '_', base_name)
+        new_filename = f"{clean_base}{RENAME_TAG}.html"
         
-        send_message(chat_id, f"📄 **{new_filename}**\n\n```html\n{preview}\n```")
-        
-        if len(updated_html) > 3000:
-            send_message(chat_id, f"📊 **Full file size:** {len(updated_html)} characters")
+        # Send actual file
+        send_document_file(
+            chat_id, 
+            new_filename, 
+            updated_html,
+            f"✅ Updated HTML file with {len(session['changes'])} changes"
+        )
         
         send_message(chat_id,
             "🎉 **File generated successfully!**\n\n"
             "📋 **Summary:**\n"
             f"✅ Changes applied: {len(session['changes'])}\n"
-            f"📄 File: `{new_filename}`\n\n"
+            f"📄 Original: `{original_filename}`\n"
+            f"📄 Updated: `{new_filename}`\n"
+            f"📊 File size: {len(updated_html)} characters\n\n"
+            "📥 **Download the file above ↑**\n\n"
             "Send /start for new session."
         )
         
@@ -569,14 +632,14 @@ def main():
         print("❌ BOT_TOKEN or OWNER_ID missing!")
         return
     
-    print("🚀 Starting Inline Buttons HTML Editor Bot...")
+    print("🚀 Starting HTML Editor Bot with REAL FILE SENDING...")
     
     # Health server
     Thread(target=run_health, daemon=True).start()
     
     # Bot polling
     offset = 0
-    print("🤖 Bot with inline buttons started!")
+    print("🤖 Bot ready to send actual HTML files!")
     
     while True:
         try:
